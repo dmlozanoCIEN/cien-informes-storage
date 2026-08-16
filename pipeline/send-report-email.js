@@ -166,12 +166,15 @@ function generarPeriodoLabel(fecha) {
 async function _actualizarEstadoInforme(informeId, estado, detalles, notas = null) {
   if (!informeId || !CONFIG.tableInformes) return;
   try {
-    await nocoRequest(`/api/v2/tables/${CONFIG.tableInformes}/records/${informeId}`, 'PATCH', {
+    // NocoDB V2 PATCH: el Id va en el body, no en la URL
+    await nocoRequest(`/api/v2/tables/${CONFIG.tableInformes}/records`, 'PATCH', {
+      Id:               Number(informeId) || informeId,
       estado,
       fecha_envio:      new Date().toISOString(),
       correos_enviados: JSON.stringify(detalles),
       ...(notas ? { notas } : {}),
     });
+
     console.log(`[Email] NocoDB actualizado: informe ${informeId} → ${estado}`);
   } catch (err) {
     console.error(`[Email] Error al actualizar NocoDB: ${err.message}`);
