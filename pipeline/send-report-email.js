@@ -37,7 +37,7 @@ async function nocoRequest(endpoint, method = 'GET', body = null) {
       path:     url.pathname + url.search,
       method,
       headers: {
-        'xc-auth':      CONFIG.nocodbToken,
+        'xc-token':     CONFIG.nocodbToken,
         'Content-Type': 'application/json',
         ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
       },
