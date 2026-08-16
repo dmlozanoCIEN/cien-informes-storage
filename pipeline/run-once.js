@@ -148,20 +148,30 @@ function calcularProximoEnvio(config) {
 
 // ─── Obtener aliados elegibles ────────────────────────────────────────────────
 async function getAliadosElegibles() {
-    // NocoDB solo acepta fecha simple 'YYYY-MM-DD' en filtros lte/gte
-  // Usamos mañana para capturar todo lo programado para hoy
-  const manana = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  let where   = `(activo,eq,true)~and(frecuencia,neq,manual)~and(proximo_envio,lte,${manana})`;
+  // Nota: proximo_envio es campo de texto en NocoDB — no soporta filtros lte/gte
+  // Se trae todo lo activo y se filtra en JS por fecha
+  let where = `(activo,eq,true)~and(frecuencia,neq,manual)`;
+
+  // Si se especificó un aliado concreto (ejecución manual desde workflow_dispatch)
   if (ALIADO_FILTER) {
     log.info(`Filtro de aliado activo: solo procesando aliado_id="${ALIADO_FILTER}"`);
     where = `(aliado_id,eq,${ALIADO_FILTER})`;
   }
 
   const res = await nocoRequest(
-    `/api/v2/tables/${CONFIG.tableConfigEnvio}/records?where=${encodeURIComponent(where)}&limit=50&sort=proximo_envio`
+    `/api/v2/tables/${CONFIG.tableConfigEnvio}/records?where=${encodeURIComponent(where)}&limit=100`
   );
-  return res.list || [];
+  const todos = res.list || [];
+
+  // Filtrar en JS: proximo_envio <= ahora, o sin fecha (nunca enviado = elegible)
+  const ahora = Date.now();
+  return todos.filter(cfg => {
+    if (!cfg.proximo_envio) return true;       // nunca configurado → elegible
+    const ts = new Date(cfg.proximo_envio).getTime();
+    return isNaN(ts) || ts <= ahora;           // fecha inválida o ya vencida → elegible
+  });
 }
+
 
 // ─── Pipeline para un aliado ─────────────────────────────────────────────────
 async function runPipeline(configEnvio) {
