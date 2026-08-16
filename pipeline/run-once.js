@@ -148,10 +148,10 @@ function calcularProximoEnvio(config) {
 
 // ─── Obtener aliados elegibles ────────────────────────────────────────────────
 async function getAliadosElegibles() {
-  // NocoDB no acepta formato ISO con 'T' y 'Z' — necesita 'YYYY-MM-DD HH:MM:SS'
-  const ahora = new Date().toISOString().replace('T', ' ').replace(/\.\d{3}Z$/, '');
-  let where = `(activo,eq,true)~and(frecuencia,neq,manual)~and(proximo_envio,lte,${ahora})`;
-
+    // NocoDB solo acepta fecha simple 'YYYY-MM-DD' en filtros lte/gte
+  // Usamos mañana para capturar todo lo programado para hoy
+  const manana = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  let where   = `(activo,eq,true)~and(frecuencia,neq,manual)~and(proximo_envio,lte,${manana})`;
   if (ALIADO_FILTER) {
     log.info(`Filtro de aliado activo: solo procesando aliado_id="${ALIADO_FILTER}"`);
     where = `(aliado_id,eq,${ALIADO_FILTER})`;
