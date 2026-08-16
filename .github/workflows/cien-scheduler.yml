@@ -2,15 +2,15 @@ name: CIEN - Envio Automatico de Informes
 
 on:
   schedule:
-    - cron: '0 13 * * *'
+    - cron: '0 13 * * *'   # 08:00 AM Colombia (UTC-5) — todos los días
   workflow_dispatch:
     inputs:
       aliado_id:
-        description: 'ID del aliado (vacío = todos)'
+        description: 'ID del aliado específico (dejar vacío para todos)'
         required: false
         default: ''
       dry_run:
-        description: 'Dry run - solo verifica sin enviar'
+        description: 'Dry run (no envía correos, solo verifica)'
         required: false
         default: 'false'
         type: boolean
@@ -25,48 +25,48 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Checkout codigo
+      - name: 📥 Checkout código
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
+      - name: ⚙️ Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
           cache: 'npm'
 
-      - name: Instalar dependencias
+      - name: 📦 Instalar dependencias
         run: npm ci
 
-      - name: Ejecutar pipeline de informes
+      - name: 🚀 Ejecutar pipeline de informes
         env:
           NOCODB_API_URL:                   ${{ secrets.NOCODB_API_URL }}
           NOCODB_API_TOKEN:                 ${{ secrets.NOCODB_API_TOKEN }}
           NOCODB_TABLE_ALIADOS:             ${{ secrets.NOCODB_TABLE_ALIADOS }}
           NOCODB_TABLE_ALIADO_INFORMES:     ${{ secrets.NOCODB_TABLE_ALIADO_INFORMES }}
           NOCODB_TABLE_ALIADO_CONFIG_ENVIO: ${{ secrets.NOCODB_TABLE_ALIADO_CONFIG_ENVIO }}
-          EMAILJS_SERVICE_ID:               ${{ secrets.EMAILJS_SERVICE_ID }}
-          EMAILJS_TEMPLATE_ID:              ${{ secrets.EMAILJS_TEMPLATE_ID }}
-          EMAILJS_PUBLIC_KEY:               ${{ secrets.EMAILJS_PUBLIC_KEY }}
-          EMAILJS_PRIVATE_KEY:              ${{ secrets.EMAILJS_PRIVATE_KEY }}
-          DASHBOARD_BASE_URL:               ${{ secrets.DASHBOARD_BASE_URL }}
-          REPORT_TOKEN_SECRET:              ${{ secrets.REPORT_TOKEN_SECRET }}
-          GH_TOKEN:                         ${{ secrets.GH_TOKEN }}
-          GH_OWNER:                         ${{ secrets.GH_OWNER }}
-          GH_REPO:                          ${{ secrets.GH_REPO }}
-          GH_BRANCH:                        ${{ secrets.GH_BRANCH }}
-          GH_BASEPATH:                      ${{ secrets.GH_BASEPATH }}
-          GH_CDN_BASE:                      ${{ secrets.GH_CDN_BASE }}
-          RUN_MODE:                         'github-actions'
-          LOG_LEVEL:                        'info'
-          ALIADO_ID_FILTER:                 ${{ github.event.inputs.aliado_id }}
-          DRY_RUN:                          ${{ github.event.inputs.dry_run }}
+          EMAILJS_SERVICE_ID:  ${{ secrets.EMAILJS_SERVICE_ID }}
+          EMAILJS_TEMPLATE_ID: ${{ secrets.EMAILJS_TEMPLATE_ID }}
+          EMAILJS_PUBLIC_KEY:  ${{ secrets.EMAILJS_PUBLIC_KEY }}
+          EMAILJS_PRIVATE_KEY: ${{ secrets.EMAILJS_PRIVATE_KEY }}
+          DASHBOARD_BASE_URL:   ${{ secrets.DASHBOARD_BASE_URL }}
+          REPORT_TOKEN_SECRET:  ${{ secrets.REPORT_TOKEN_SECRET }}
+          GH_TOKEN:    ${{ secrets.GH_TOKEN }}
+          GH_OWNER:    ${{ secrets.GH_OWNER }}
+          GH_REPO:     ${{ secrets.GH_REPO }}
+          GH_BRANCH:   ${{ secrets.GH_BRANCH }}
+          GH_BASEPATH: ${{ secrets.GH_BASEPATH }}
+          GH_CDN_BASE: ${{ secrets.GH_CDN_BASE }}
+          RUN_MODE:  'github-actions'
+          LOG_LEVEL: 'info'
+          ALIADO_ID_FILTER: ${{ github.event.inputs.aliado_id }}
+          DRY_RUN:          ${{ github.event.inputs.dry_run }}
         run: node pipeline/run-once.js
 
-      - name: Guardar log
+      - name: 📋 Guardar log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cien-log-${{ github.run_number }}
+          name: cien-scheduler-log-${{ github.run_number }}
           path: pipeline-run.log
           retention-days: 30
           if-no-files-found: ignore
