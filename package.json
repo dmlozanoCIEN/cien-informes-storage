@@ -1,0 +1,17 @@
+{
+  "name": "cien-pipeline",
+  "version": "1.0.0",
+  "description": "Pipeline de informes automáticos CIEN",
+  "main": "pipeline/scheduler.js",
+  "scripts": {
+    "scheduler": "node pipeline/scheduler.js",
+    "send-now": "node pipeline/scheduler.js --run-once"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-cron": "^3.0.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
