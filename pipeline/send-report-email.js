@@ -113,9 +113,10 @@ async function getContactosEnvio(aliadoId) {
   if (!contactos.length) {
     try {
       const res = await nocoRequest(`/api/v2/tables/${CONFIG.tableAliados}/records/${aliadoId}`);
-      const posiblesEmails = [
-        res.email_contacto, res.correo_contacto, res.email, res.correo,
-        res.Email, res.Correo, res.email_informe, res.correos_envio,
+            const posiblesEmails = [
+        res.emails_copia, res.email_contacto, res.correo_contacto,
+        res.email, res.correo, res.Email, res.Correo,
+        res.email_informe, res.correos_envio,
       ].filter(Boolean);
       posiblesEmails.forEach(val => {
         String(val).split(/[,;\n]/).map(e => e.trim()).filter(e => e.includes('@')).forEach(email => {
