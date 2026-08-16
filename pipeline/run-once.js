@@ -158,19 +158,34 @@ async function getAliadosElegibles() {
     where = `(aliado_id,eq,${ALIADO_FILTER})`;
   }
 
-  const res = await nocoRequest(
+  const res  = await nocoRequest(
     `/api/v2/tables/${CONFIG.tableConfigEnvio}/records?where=${encodeURIComponent(where)}&limit=100`
   );
   const todos = res.list || [];
+  log.info(`Registros encontrados en NocoDB: ${todos.length}`);
+
+  // Si hay filtro manual de aliado (workflow_dispatch), NO filtrar por fecha
+  // El admin quiere forzar el envío independientemente del proximo_envio
+  if (ALIADO_FILTER) {
+    log.info(`Modo manual: omitiendo filtro de fecha para aliado_id="${ALIADO_FILTER}"`);
+    todos.forEach(cfg => {
+      log.info(`  → aliado_id=${cfg.aliado_id} | activo=${cfg.activo} | frecuencia=${cfg.frecuencia} | proximo_envio=${cfg.proximo_envio || '(vacío)'}`);
+    });
+    return todos;
+  }
 
   // Filtrar en JS: proximo_envio <= ahora, o sin fecha (nunca enviado = elegible)
   const ahora = Date.now();
-  return todos.filter(cfg => {
-    if (!cfg.proximo_envio) return true;       // nunca configurado → elegible
+  const elegibles = todos.filter(cfg => {
+    if (!cfg.proximo_envio) return true;
     const ts = new Date(cfg.proximo_envio).getTime();
-    return isNaN(ts) || ts <= ahora;           // fecha inválida o ya vencida → elegible
+    const ok = isNaN(ts) || ts <= ahora;
+    if (!ok) log.debug(`  Descartado aliado_id=${cfg.aliado_id}: proximo_envio=${cfg.proximo_envio} está en el futuro`);
+    return ok;
   });
+  return elegibles;
 }
+
 
 
 // ─── Pipeline para un aliado ─────────────────────────────────────────────────
