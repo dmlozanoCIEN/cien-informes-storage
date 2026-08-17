@@ -2,7 +2,7 @@ name: CIEN - Envio Automatico de Informes
 
 on:
   schedule:
-    - cron: '45 22 * * *'   # 05:45 PM Colombia (UTC-5)
+    - cron: '30 3 * * *'   # 10:30 PM Colombia (UTC-5)
   workflow_dispatch:
     inputs:
       aliado_id:
