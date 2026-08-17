@@ -37,9 +37,6 @@ jobs:
         run: npm install
 
 
-      - name: 📦 Instalar dependencias
-        run: npm ci
-
       - name: 🚀 Ejecutar pipeline de informes
         env:
           NOCODB_API_URL:                   ${{ secrets.NOCODB_API_URL }}
