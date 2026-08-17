@@ -31,7 +31,7 @@ const { downloadExcel }               = require('./download-excel');
 const { uploadExcel }                 = require('./upload-to-repo');
 const { generateReportUrl, generateUUID } = require('./generate-report-url');
 const { sendReportEmail }             = require('./send-report-email');
-
+const { extractKpis } = require('./extract-kpis');
 // ─── Configuración ───────────────────────────────────────────────────────────
 const IS_GH_ACTIONS = process.env.RUN_MODE === 'github-actions';
 const DRY_RUN       = process.env.DRY_RUN === 'true';
@@ -232,7 +232,11 @@ async function runPipeline(configEnvio) {
     log.info(`[1/5] Descargando Excel desde CMS...`);
     const dl = await downloadExcel({ aliadoId, fecha, cmsEndpoint, aliadoNombre });
     log.info(`Excel descargado: ${(dl.byteSize / 1024).toFixed(1)} KB`);
-
+        // PASO 2b: Extraer KPIs del Excel descargado
+    log.info(`Extrayendo KPIs del Excel...`);
+    const kpis = extractKpis(dl.buffer);
+    if (kpis.error) log.warn(`KPIs con error parcial: ${kpis.error}`);
+    else log.info(`KPIs: sesiones=${kpis.total_sesiones} | usuarios=${kpis.usuarios_unicos} | kWh=${kpis.kwh_total} | ingresos=${kpis.ingresos_netos} | ocupacion=${kpis.tasa_ocupacion ?? 'N/D'}%`);
     // PASO 3: Subir Excel al repo (GitHub → jsDelivr CDN)
     log.info(`[2/5] Subiendo Excel al repositorio...`);
     const up = await uploadExcel({ fileBuffer: dl.buffer, aliadoId, fecha });
@@ -265,7 +269,7 @@ async function runPipeline(configEnvio) {
     log.info(`[4/5] Enviando correo via EmailJS...`);
     const send = await sendReportEmail({
       aliadoId, aliadoNombre, reportUuid,
-      urlDashboard: dashboardUrl, fecha, kpis: {}, informeId,
+      urlDashboard: dashboardUrl, fecha, kpis, informeId,
     });
     log.info(`Correos: ${send.totalEnviados} enviados · ${send.totalErrores} errores · estado=${send.estado}`);
 
