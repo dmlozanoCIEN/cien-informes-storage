@@ -1,8 +1,10 @@
 name: CIEN - Envio Automatico de Informes
+# Actualizado: 2026-08-17 — forzar reconocimiento de schedule
 
 on:
   schedule:
-    - cron: '3 4 * * *'   # PRUEBA — 04:03 UTC (11:03 PM Colombia)  workflow_dispatch:
+    - cron: '5 4 * * *'   # 11:05 PM Colombia (UTC-5)
+  workflow_dispatch:
     inputs:
       aliado_id:
         description: 'ID del aliado específico (dejar vacío para todos)'
@@ -34,7 +36,6 @@ jobs:
 
       - name: 📦 Instalar dependencias
         run: npm install
-
 
       - name: 🚀 Ejecutar pipeline de informes
         env:
