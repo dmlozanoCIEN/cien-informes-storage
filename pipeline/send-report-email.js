@@ -323,10 +323,14 @@ async function sendReportEmail({
   }
 
   // ── 1. Obtener contactos ──────────────────────────────────────────────────
+  // Si vienen pre-cargados desde run-once.js (ya se hizo el GET del aliado),
+  // usarlos directamente sin hacer otra llamada a NocoDB (evita HTTP 429).
   let contactos = contactosManuales;
   if (!contactos || !contactos.length) {
     console.log(`${logPrefix} → Obteniendo contactos desde NocoDB...`);
     contactos = await getContactosEnvio(aliadoId);
+  } else {
+    console.log(`${logPrefix} → Usando ${contactos.length} contacto(s) pre-cargados (sin llamada extra a NocoDB)`);
   }
 
   if (!contactos.length) {
