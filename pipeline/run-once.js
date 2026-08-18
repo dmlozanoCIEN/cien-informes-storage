@@ -31,7 +31,8 @@ const { downloadExcel }               = require('./download-excel');
 const { uploadExcel }                 = require('./upload-to-repo');
 const { generateReportUrl, generateUUID } = require('./generate-report-url');
 const { sendReportEmail }             = require('./send-report-email');
-const { extractKpis } = require('./extract-kpis');
+const { extractKpis }                 = require('./extract-kpis');
+
 // ─── Configuración ───────────────────────────────────────────────────────────
 const IS_GH_ACTIONS = process.env.RUN_MODE === 'github-actions';
 const DRY_RUN       = process.env.DRY_RUN === 'true';
@@ -47,12 +48,13 @@ const CONFIG = {
   tableInformes:    process.env.NOCODB_TABLE_ALIADO_INFORMES      || 'm4twk0jq7wduk62',
   tableConfigEnvio: process.env.NOCODB_TABLE_ALIADO_CONFIG_ENVIO  || 'mdkn6wr2truap7a',
   dashboardBaseUrl: process.env.DASHBOARD_BASE_URL                || 'https://cien.app/dashboard/cien-dashboard-v2.html',
-  maxConcurrent:    parseInt(process.env.MAX_CONCURRENT || '3'),
   jobTimeoutMs:     parseInt(process.env.JOB_TIMEOUT_MS || '120000'),
+  // Delay entre aliados para evitar HTTP 429 de NocoDB (ms)
+  delayEntreAliados: parseInt(process.env.DELAY_ENTRE_ALIADOS_MS || '3000'),
 };
 
 // ─── Logger ──────────────────────────────────────────────────────────────────
-const LOG_LINES = [];
+const LOG_LINES = []; // acumula para guardar en archivo al final
 
 function _log(level, ...args) {
   if (LOG_LEVELS[level] < LOG_LEVEL) return;
@@ -60,6 +62,7 @@ function _log(level, ...args) {
   const line = `[${ts}] [${level.toUpperCase()}] ${args.join(' ')}`;
   LOG_LINES.push(line);
 
+  // GitHub Actions: usar ::notice/::warning/::error para highlight en UI
   if (IS_GH_ACTIONS) {
     if      (level === 'error') console.error(`::error::${args.join(' ')}`);
     else if (level === 'warn')  console.warn(`::warning::${args.join(' ')}`);
@@ -114,9 +117,10 @@ function nocoRequest(endpoint, method = 'GET', body = null) {
 
 // ─── Calcular próximo envío (hora Colombia UTC-5) ────────────────────────────
 function calcularProximoEnvio(config) {
+  // Colombia es UTC-5 fijo (sin horario de verano)
   const COL_MS = -5 * 60 * 60 * 1000;
   const nowUtc = Date.now();
-  const nowCol = new Date(nowUtc + COL_MS);
+  const nowCol = new Date(nowUtc + COL_MS); // getHours() devuelve hora Colombia
 
   const [hora, minuto] = (config.hora_envio || '08:00').split(':').map(Number);
   const next = new Date(nowCol);
@@ -127,8 +131,8 @@ function calcularProximoEnvio(config) {
       if (next <= nowCol) next.setDate(next.getDate() + 1);
       break;
     case 'semanal': {
-      const target = parseInt(config.dia_semana ?? 1);
-      const diff   = (target - nowCol.getDay() + 7) % 7;
+      const target   = parseInt(config.dia_semana ?? 1);
+      const diff     = (target - nowCol.getDay() + 7) % 7;
       if (diff === 0 && next <= nowCol) next.setDate(next.getDate() + 7);
       else next.setDate(next.getDate() + diff);
       break;
@@ -143,6 +147,7 @@ function calcularProximoEnvio(config) {
       return new Date(nowCol.getFullYear() + 100, 0, 1).toISOString();
   }
 
+  // Convertir de hora-Colombia a UTC real
   return new Date(next.getTime() - COL_MS).toISOString();
 }
 
@@ -177,7 +182,7 @@ async function getAliadosElegibles() {
   // Filtrar en JS: proximo_envio <= ahora, o sin fecha (nunca enviado = elegible)
   const ahora = Date.now();
   const elegibles = todos.filter(cfg => {
-    if (!cfg.proximo_envio) return true;
+    if (!cfg.proximo_envio) return true;          // nunca configurado → elegible
     const ts = new Date(cfg.proximo_envio).getTime();
     const ok = isNaN(ts) || ts <= ahora;
     if (!ok) log.debug(`  Descartado aliado_id=${cfg.aliado_id}: proximo_envio=${cfg.proximo_envio} está en el futuro`);
@@ -186,7 +191,45 @@ async function getAliadosElegibles() {
   return elegibles;
 }
 
+// ─── Extraer emails de un registro de aliado ─────────────────────────────────
+function _extraerEmails(registro) {
+  const contactos = [];
+  if (!registro) return contactos;
 
+  // Campos donde pueden estar los emails (en orden de prioridad)
+  // emails_contacto primero — es el campo replicado desde el portal al guardar config
+  const camposEmail = [
+    registro.emails_contacto,  // ← campo replicado desde portal (prioridad máxima)
+    registro.emails_copia,
+    registro.email_contacto,
+    registro.correo_contacto,
+    registro.email,
+    registro.correo,
+    registro.Email,
+    registro.Correo,
+    registro.email_informe,
+    registro.correos_envio,
+  ];
+
+  const nombre = registro.nombre || registro.Nombre || registro.name || registro.Name || '';
+
+  camposEmail
+    .filter(Boolean)
+    .forEach(val => {
+      String(val)
+        .split(/[,;\n]/)        // separado por comas, punto y coma, o salto de línea
+        .map(e => e.trim())
+        .filter(e => e.includes('@'))
+        .forEach(email => {
+          const emailLower = email.toLowerCase();
+          if (!contactos.some(c => c.email === emailLower)) {
+            contactos.push({ email: emailLower, nombre });
+          }
+        });
+    });
+
+  return contactos;
+}
 
 // ─── Pipeline para un aliado ─────────────────────────────────────────────────
 async function runPipeline(configEnvio) {
@@ -200,15 +243,37 @@ async function runPipeline(configEnvio) {
 
   let aliadoNombre = configEnvio.aliado_nombre || aliadoId;
   let informeId    = null;
+  let contactos    = [];
 
   log.info(`── INICIO pipeline: aliado=${aliadoId} fecha=${fecha} uuid=${reportUuid}`);
 
   try {
-    // PASO 0: Obtener nombre del aliado
+    // PASO 0: Obtener datos del aliado (nombre + emails en UNA sola llamada)
     try {
       const a = await nocoRequest(`/api/v2/tables/${CONFIG.tableAliados}/records/${aliadoId}`);
       aliadoNombre = a.nombre || a.Nombre || a.name || a.Name || aliadoNombre;
-    } catch (e) { log.warn(`No se pudo obtener nombre aliado: ${e.message}`); }
+
+      // Primero intentar contactos desde aliado_config_envio (ya los tenemos en memoria)
+      contactos = _extraerEmails(configEnvio);
+
+      // Si la config no tiene emails, tomar del registro del aliado
+      if (!contactos.length) {
+        contactos = _extraerEmails(a);
+        if (contactos.length) {
+          log.info(`Contactos desde ficha del aliado: ${contactos.map(c => c.email).join(', ')}`);
+        }
+      } else {
+        log.info(`Contactos desde config_envio: ${contactos.map(c => c.email).join(', ')}`);
+      }
+    } catch (e) {
+      log.warn(`No se pudo obtener datos del aliado: ${e.message}`);
+      // Intentar contactos solo desde configEnvio aunque falló el GET del aliado
+      contactos = _extraerEmails(configEnvio);
+    }
+
+    if (!contactos.length) {
+      log.warn(`⚠️  Aliado ${aliadoId} no tiene emails configurados — se omitirá el envío de correo`);
+    }
 
     // PASO 1: Registrar informe como 'pendiente'
     try {
@@ -232,18 +297,20 @@ async function runPipeline(configEnvio) {
     log.info(`[1/5] Descargando Excel desde CMS...`);
     const dl = await downloadExcel({ aliadoId, fecha, cmsEndpoint, aliadoNombre });
     log.info(`Excel descargado: ${(dl.byteSize / 1024).toFixed(1)} KB`);
-        // PASO 2b: Extraer KPIs del Excel descargado
+
+    // PASO 2b: Extraer KPIs del Excel descargado
     log.info(`Extrayendo KPIs del Excel...`);
     const kpis = extractKpis(dl.buffer);
     if (kpis.error) log.warn(`KPIs con error parcial: ${kpis.error}`);
     else log.info(`KPIs: sesiones=${kpis.total_sesiones} | usuarios=${kpis.usuarios_unicos} | kWh=${kpis.kwh_total} | ingresos=${kpis.ingresos_netos} | ocupacion=${kpis.tasa_ocupacion ?? 'N/D'}%`);
-    // PASO 3: Subir Excel al repo (GitHub → jsDelivr CDN)
+
+    // PASO 3: Subir Excel al repo (GitHub → CDN)
     log.info(`[2/5] Subiendo Excel al repositorio...`);
     const up = await uploadExcel({ fileBuffer: dl.buffer, aliadoId, fecha });
     const excelUrl = up.cdnUrl || up.publicUrl;
     log.info(`Excel publicado: ${excelUrl}`);
 
-    // PASO 4: Generar URL del dashboard
+    // PASO 4: Generar URL del dashboard con clave si está configurada
     log.info(`[3/5] Generando URL del informe...`);
     const { dashboardUrl } = generateReportUrl({
       aliadoId,
@@ -252,7 +319,7 @@ async function runPipeline(configEnvio) {
       reportUuid,
       fecha,
       dashboardBase: CONFIG.dashboardBaseUrl,
-      claveAcceso,
+      claveAcceso,   // incluye &key= si está configurada
     });
     log.info(`URL: ${dashboardUrl.slice(0, 100)}...`);
 
@@ -265,11 +332,13 @@ async function runPipeline(configEnvio) {
       } catch (e) { log.warn(`No se pudo actualizar URLs en NocoDB: ${e.message}`); }
     }
 
-    // PASO 6: Enviar correo
+    // PASO 6: Enviar correo con KPIs reales
     log.info(`[4/5] Enviando correo via EmailJS...`);
     const send = await sendReportEmail({
       aliadoId, aliadoNombre, reportUuid,
       urlDashboard: dashboardUrl, fecha, kpis, informeId,
+      // Pasar contactos pre-cargados → send-report-email NO hace GET extra a NocoDB
+      contactos: contactos.length ? contactos : null,
     });
     log.info(`Correos: ${send.totalEnviados} enviados · ${send.totalErrores} errores · estado=${send.estado}`);
 
@@ -304,8 +373,8 @@ async function main() {
   log.info('════════════════════════════════════════');
   log.info(`CIEN Scheduler — run-once`);
   log.info(`Hora UTC:      ${new Date().toISOString()}`);
-  const colHora = new Date(Date.now() + (-5 * 60 * 60 * 1000));
-  log.info(`Hora Colombia: ${colHora.toISOString().replace('T', ' ').slice(0, 19)}`);
+  const colHora = new Date(Date.now() + (-5*60*60*1000));
+  log.info(`Hora Colombia: ${colHora.toISOString().replace('T',' ').slice(0,19)}`);
   log.info(`Modo:          ${DRY_RUN ? 'DRY RUN (sin envíos)' : 'PRODUCCIÓN'}`);
   if (ALIADO_FILTER) log.info(`Aliado filtro: ${ALIADO_FILTER}`);
   log.info('════════════════════════════════════════');
@@ -321,19 +390,22 @@ async function main() {
       log.info(`${elegibles.length} aliado(s) a procesar`);
 
       const resultados = [];
-      for (let i = 0; i < elegibles.length; i += CONFIG.maxConcurrent) {
-        const lote = elegibles.slice(i, i + CONFIG.maxConcurrent);
-        const res  = await Promise.all(
-          lote.map(cfg =>
-            Promise.race([
-              runPipeline(cfg),
-              new Promise((_, rej) =>
-                setTimeout(() => rej(new Error('Timeout')), CONFIG.jobTimeoutMs)
-              ),
-            ]).catch(err => ({ success: false, aliadoId: cfg.aliado_id, error: err.message }))
-          )
-        );
-        resultados.push(...res);
+      // Procesar en SERIE con delay para no saturar NocoDB (evitar HTTP 429)
+      for (let i = 0; i < elegibles.length; i++) {
+        const cfg = elegibles[i];
+        const res = await Promise.race([
+          runPipeline(cfg),
+          new Promise((_, rej) =>
+            setTimeout(() => rej(new Error('Timeout')), CONFIG.jobTimeoutMs)
+          ),
+        ]).catch(err => ({ success: false, aliadoId: cfg.aliado_id, error: err.message }));
+        resultados.push(res);
+
+        // Delay entre aliados para respetar el rate-limit de NocoDB
+        if (i < elegibles.length - 1) {
+          log.info(`⏳ Esperando ${CONFIG.delayEntreAliados / 1000}s antes del siguiente aliado...`);
+          await new Promise(r => setTimeout(r, CONFIG.delayEntreAliados));
+        }
       }
 
       const ok  = resultados.filter(r => r.success).length;
@@ -358,6 +430,7 @@ async function main() {
   const totalSec = ((Date.now() - startTotal) / 1000).toFixed(1);
   log.info(`Tiempo total: ${totalSec}s`);
 
+  // Guardar log en archivo (el workflow lo sube como artefacto)
   try {
     fs.writeFileSync(
       path.join(process.cwd(), 'pipeline-run.log'),
