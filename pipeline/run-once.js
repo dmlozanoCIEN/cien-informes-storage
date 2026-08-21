@@ -28,7 +28,7 @@ try { require('dotenv').config({ path: path.join(__dirname, '.env') }); } catch 
 
 // ─── Importar módulos del pipeline ───────────────────────────────────────────
 const { downloadExcel }               = require('./download-excel');
-const { uploadExcel }                 = require('./upload-to-repo');
+// upload-to-repo ya no se usa: la URL del Excel viene directamente del cms_endpoint (R2/CDN)
 const { generateReportUrl, generateUUID } = require('./generate-report-url');
 const { sendReportEmail }             = require('./send-report-email');
 const { extractKpis }                 = require('./extract-kpis');
@@ -191,6 +191,37 @@ async function getAliadosElegibles() {
   return elegibles;
 }
 
+// ─── Limpiar URL del Excel (quitar params de fecha/aliado que agrega el CMS) ──
+/**
+ * Dado el cms_endpoint configurado en NocoDB, devuelve la URL pública limpia
+ * del archivo Excel (sin parámetros ?aliado_id=&fecha= que agrega download-excel).
+ *
+ * Ejemplos:
+ *   "https://pub-xxx.r2.dev/SessionesGEII.xlsx"           → mismo (ya es limpia)
+ *   "https://pub-xxx.r2.dev/SessionesGEII.xlsx?aliado_id=7&fecha=2026-08" → base
+ *   "https://api.cms.com/export?token=abc&aliado_id=7"    → sin aliado_id/fecha
+ *
+ * Si el endpoint ya es una URL directa al .xlsx en R2/CDN, la devuelve tal cual.
+ */
+function _limpiarExcelUrl(cmsEndpoint) {
+  if (!cmsEndpoint) return '';
+  try {
+    const u = new URL(cmsEndpoint);
+    // Si la URL apunta directamente a un .xlsx (sin path de API), usarla limpia
+    if (u.pathname.toLowerCase().endsWith('.xlsx')) {
+      // Quitar solo los params que agrega el pipeline (aliado_id, fecha)
+      u.searchParams.delete('aliado_id');
+      u.searchParams.delete('fecha');
+      return u.toString();
+    }
+    // Si es un endpoint de API (export, download, etc.) devolver tal cual
+    // — el dashboard la usará como está para que el usuario pueda abrirla
+    return cmsEndpoint;
+  } catch (_) {
+    return cmsEndpoint;
+  }
+}
+
 // ─── Extraer emails de un registro de aliado ─────────────────────────────────
 function _extraerEmails(registro) {
   const contactos = [];
@@ -293,8 +324,15 @@ async function runPipeline(configEnvio) {
       return { success: true, aliadoId, aliadoNombre, dry: true, durationMs: Date.now() - start };
     }
 
-    // PASO 2: Descargar Excel
-    log.info(`[1/5] Descargando Excel desde CMS...`);
+    // PASO 1b: Determinar la URL pública del Excel
+    // Usamos directamente el cms_endpoint configurado en NocoDB como URL del Excel.
+    // Ese campo contiene la URL pública del archivo en R2/CDN — NO necesitamos
+    // subirlo a GitHub. Solo descargamos el archivo para extraer los KPIs.
+    const excelUrl = _limpiarExcelUrl(cmsEndpoint);
+    log.info(`Excel URL (desde config): ${excelUrl}`);
+
+    // PASO 2: Descargar Excel (solo para extraer KPIs — no se sube a ningún lado)
+    log.info(`[1/4] Descargando Excel para extraer KPIs...`);
     const dl = await downloadExcel({ aliadoId, fecha, cmsEndpoint, aliadoNombre });
     log.info(`Excel descargado: ${(dl.byteSize / 1024).toFixed(1)} KB`);
 
@@ -304,26 +342,20 @@ async function runPipeline(configEnvio) {
     if (kpis.error) log.warn(`KPIs con error parcial: ${kpis.error}`);
     else log.info(`KPIs: sesiones=${kpis.total_sesiones} | usuarios=${kpis.usuarios_unicos} | kWh=${kpis.kwh_total} | ingresos=${kpis.ingresos_netos} | ocupacion=${kpis.tasa_ocupacion ?? 'N/D'}%`);
 
-    // PASO 3: Subir Excel al repo (GitHub → CDN)
-    log.info(`[2/5] Subiendo Excel al repositorio...`);
-    const up = await uploadExcel({ fileBuffer: dl.buffer, aliadoId, fecha });
-    const excelUrl = up.cdnUrl || up.publicUrl;
-    log.info(`Excel publicado: ${excelUrl}`);
-
-    // PASO 4: Generar URL del dashboard con clave si está configurada
-    log.info(`[3/5] Generando URL del informe...`);
+    // PASO 3: Generar URL del dashboard apuntando al Excel original en R2/CDN
+    log.info(`[2/4] Generando URL del informe...`);
     const { dashboardUrl } = generateReportUrl({
       aliadoId,
       aliadoName:    aliadoNombre,
-      excelUrl,
+      excelUrl,          // ← URL original de R2/CDN, no de GitHub
       reportUuid,
       fecha,
       dashboardBase: CONFIG.dashboardBaseUrl,
-      claveAcceso,   // incluye &key= si está configurada
+      claveAcceso,
     });
-    log.info(`URL: ${dashboardUrl.slice(0, 100)}...`);
+    log.info(`URL dashboard: ${dashboardUrl.slice(0, 120)}...`);
 
-    // PASO 5: Actualizar informe en NocoDB con URLs
+    // PASO 3b: Actualizar informe en NocoDB con URLs
     if (informeId) {
       try {
         await nocoRequest(`/api/v2/tables/${CONFIG.tableInformes}/records`, 'PATCH', {
@@ -332,8 +364,8 @@ async function runPipeline(configEnvio) {
       } catch (e) { log.warn(`No se pudo actualizar URLs en NocoDB: ${e.message}`); }
     }
 
-    // PASO 6: Enviar correo con KPIs reales
-    log.info(`[4/5] Enviando correo via EmailJS...`);
+    // PASO 4: Enviar correo con KPIs reales
+    log.info(`[3/4] Enviando correo via EmailJS...`);
     const send = await sendReportEmail({
       aliadoId, aliadoNombre, reportUuid,
       urlDashboard: dashboardUrl, fecha, kpis, informeId,
@@ -342,8 +374,8 @@ async function runPipeline(configEnvio) {
     });
     log.info(`Correos: ${send.totalEnviados} enviados · ${send.totalErrores} errores · estado=${send.estado}`);
 
-    // PASO 7: Actualizar próximo_envio
-    log.info(`[5/5] Actualizando próximo envío...`);
+    // PASO 5: Actualizar próximo_envio
+    log.info(`[4/4] Actualizando próximo envío...`);
     const proximo = calcularProximoEnvio(configEnvio);
     try {
       const cfgId = configEnvio.Id || configEnvio.id;
