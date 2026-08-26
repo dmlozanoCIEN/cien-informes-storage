@@ -288,7 +288,8 @@ function generarPeriodoLabel(fecha) {
  * @param {string}  params.reportUuid        UUID único del informe
  * @param {string}  params.urlDashboard      URL completa del dashboard con params
  * @param {string}  params.fecha             'YYYY-MM' del período
- * @param {object}  params.kpis             KPIs del informe (sesiones, kWh, etc.)
+ * @param {object}  params.kpis             KPIs del informe (sesiones, kWh, etc.) — idealmente del último día
+ * @param {string}  [params.ultimoDia]       Fecha 'YYYY-MM-DD' del último día de operación (para etiqueta en correo)
  * @param {string}  [params.informeId]       ID del registro en aliado_informes (para PATCH)
  * @param {ContactoEnvio[]} [params.contactos]  Lista manual de contactos (opcional)
  *
@@ -309,6 +310,7 @@ async function sendReportEmail({
   urlDashboard,
   fecha,
   kpis = {},
+  ultimoDia = null,
   informeId = null,
   contactos: contactosManuales = null,
 }) {
@@ -356,6 +358,20 @@ async function sendReportEmail({
     day: '2-digit', month: 'long', year: 'numeric'
   });
 
+  // Etiqueta del día al que corresponden los KPIs del correo
+  // Si ultimoDia está disponible, se formatea como 'Martes 26 de agosto de 2026'
+  let kpisDiaLabel = periodo; // fallback: período del informe
+  if (ultimoDia && /^\d{4}-\d{2}-\d{2}$/.test(ultimoDia)) {
+    try {
+      const d = new Date(ultimoDia + 'T12:00:00');
+      kpisDiaLabel = d.toLocaleDateString('es-CO', {
+        weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
+      });
+      // Capitalizar primera letra
+      kpisDiaLabel = kpisDiaLabel.charAt(0).toUpperCase() + kpisDiaLabel.slice(1);
+    } catch (_) { kpisDiaLabel = ultimoDia; }
+  }
+
   // ── 3. Enviar un correo por cada contacto ─────────────────────────────────
   const detalles = [];
   let totalEnviados = 0;
@@ -375,12 +391,17 @@ async function sendReportEmail({
       fecha_generacion: fechaGeneracion,
       año_actual:      String(new Date().getFullYear()),
 
-      // KPIs formateados
+      // KPIs formateados (corresponden al último día de operación del Excel)
       total_sesiones:  kpisFormateados.total_sesiones,
       usuarios_unicos: kpisFormateados.usuarios_unicos,
       kwh_total:       kpisFormateados.kwh_total,
       ingresos_netos:  kpisFormateados.ingresos_netos,
       tasa_ocupacion:  kpisFormateados.tasa_ocupacion,
+
+      // Etiqueta del período/día al que pertenecen los KPIs mostrados en el correo
+      // Si se pasó ultimoDia, muestra la fecha exacta; si no, muestra el período del informe.
+      kpis_dia_label:  kpisDiaLabel,
+      kpis_dia_raw:    ultimoDia || '',  // 'YYYY-MM-DD' por si la plantilla EmailJS lo necesita
 
       // Metadata interna (para trazabilidad en EmailJS Activity)
       report_uuid:     reportUuid,
