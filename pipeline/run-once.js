@@ -337,18 +337,33 @@ async function runPipeline(configEnvio) {
     log.info(`Excel descargado: ${(dl.byteSize / 1024).toFixed(1)} KB`);
 
     // PASO 2b: Extraer KPIs del Excel descargado
-    log.info(`Extrayendo KPIs del Excel...`);
+    log.info(`Extrayendo KPIs del Excel (buffer: ${dl.buffer ? dl.buffer.length + ' bytes' : 'null'})...`);
     const kpis = extractKpis(dl.buffer);
+
+    // Log completo del objeto kpis para diagnóstico en GitHub Actions
+    log.info(`[DIAG] kpis raw = ${JSON.stringify({
+      total_sesiones:  kpis.total_sesiones,
+      usuarios_unicos: kpis.usuarios_unicos,
+      kwh_total:       kpis.kwh_total,
+      ingresos_netos:  kpis.ingresos_netos,
+      ultimo_dia:      kpis.ultimo_dia,
+      tiene_kpis_dia:  !!kpis.kpis_ultimo_dia,
+      error:           kpis.error,
+    })}`);
+
     if (kpis.error) log.warn(`KPIs con error parcial: ${kpis.error}`);
-    else log.info(`KPIs: sesiones=${kpis.total_sesiones} | usuarios=${kpis.usuarios_unicos} | kWh=${kpis.kwh_total} | ingresos=${kpis.ingresos_netos} | ocupacion=${kpis.tasa_ocupacion ?? 'N/D'}%`);
+    else log.info(`KPIs globales: sesiones=${kpis.total_sesiones} | usuarios=${kpis.usuarios_unicos} | kWh=${kpis.kwh_total} | ingresos=${kpis.ingresos_netos}`);
 
     // Último día de operación detectado en el Excel (para pre-filtrar dashboard y correo)
-    const ultimoDia    = kpis.ultimo_dia    || null;
-    const kpisCorreo   = kpis.kpis_ultimo_dia || kpis; // Usar KPIs del último día si están disponibles
+    const ultimoDia  = kpis.ultimo_dia    || null;
+    // kpisCorreo: usar KPIs del último día si están disponibles; si no, KPIs globales como fallback
+    const kpisCorreo = kpis.kpis_ultimo_dia || kpis;
+
     if (ultimoDia) {
-      log.info(`Último día de operación: ${ultimoDia} | sesiones=${kpisCorreo.total_sesiones} kWh=${kpisCorreo.kwh_total} ingresos=${kpisCorreo.ingresos_netos}`);
+      log.info(`✅ Último día detectado: ${ultimoDia} | sesiones=${kpisCorreo.total_sesiones} kWh=${kpisCorreo.kwh_total} ingresos=${kpisCorreo.ingresos_netos} usuarios=${kpisCorreo.usuarios_unicos}`);
     } else {
-      log.warn(`No se detectó último día (columna STARTED AT ausente) — se usarán KPIs globales en el correo`);
+      log.warn(`⚠️  Último día NO detectado (STARTED AT no encontrado en ninguna hoja) — correo usará KPIs globales`);
+      log.warn(`    KPIs globales (fallback): sesiones=${kpis.total_sesiones} kWh=${kpis.kwh_total} ingresos=${kpis.ingresos_netos}`);
     }
 
     // PASO 3: Generar URL del dashboard apuntando al Excel original en R2/CDN
