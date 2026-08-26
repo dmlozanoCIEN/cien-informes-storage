@@ -44,18 +44,21 @@ function g(row, ...keys) {
  * @param {Buffer} buffer   Buffer del archivo .xlsx
  * @returns {object}        KPIs calculados
  *   {
- *     total_sesiones:  number,
- *     usuarios_unicos: number,
- *     kwh_total:       number,
- *     ingresos_netos:  number,
- *     tasa_ocupacion:  number|null,  // % 0-100 o null si no se puede calcular
- *     error:           string|null,  // mensaje si hubo algún problema
+ *     total_sesiones:   number,
+ *     usuarios_unicos:  number,
+ *     kwh_total:        number,
+ *     ingresos_netos:   number,
+ *     tasa_ocupacion:   number|null,   // % 0-100 o null (se calcula en Dashboard)
+ *     error:            string|null,   // mensaje si hubo algún problema
+ *     ultimo_dia:       string|null,   // 'YYYY-MM-DD' del último día con sesiones
+ *     kpis_ultimo_dia:  object|null,   // mismos KPIs pero solo del ultimo_dia
  *   }
  */
 function extractKpis(buffer) {
   const empty = {
     total_sesiones: 0, usuarios_unicos: 0,
     kwh_total: 0, ingresos_netos: 0, tasa_ocupacion: null, error: null,
+    ultimo_dia: null, kpis_ultimo_dia: null,
   };
 
   if (!XLSX) {
@@ -70,6 +73,10 @@ function extractKpis(buffer) {
     let totalKwh       = 0;
     let totalIngresos  = 0;
     const usuariosSet  = new Set();
+
+    // Acumuladores por día (para calcular kpis_ultimo_dia)
+    // Estructura: { 'YYYY-MM-DD': { sesiones, kwh, ingresos, usuarios: Set } }
+    const porDia = {};
 
     // Procesar todas las hojas (puede haber una por mes)
     for (const sheetName of wb.SheetNames) {
@@ -132,7 +139,67 @@ function extractKpis(buffer) {
           )
         ) || 0;
         totalIngresos += (amount - idling);
+
+        // ── Acumular por día: extraer fecha de "STARTED AT" ─────────────────
+        const startedAt = g(row,
+          'STARTED AT', 'started at',
+          'START_AT', 'start at',
+          'START TIME', 'start_time',
+          'START DATE', 'start_date',
+          'FECHA INICIO', 'fecha_inicio',
+          'FECHA', 'fecha',
+        );
+
+        let dateStr = null;
+        if (startedAt) {
+          // Puede ser Date (cellDates:true), string 'YYYY-MM-DD HH:mm' o número Excel
+          if (startedAt instanceof Date) {
+            dateStr = startedAt.toISOString().slice(0, 10);
+          } else {
+            const s = String(startedAt).trim();
+            // Intentar parsear 'YYYY-MM-DD' o 'YYYY-MM-DD HH:mm:ss' o 'MM/DD/YYYY ...'
+            const isoMatch = s.match(/^(\d{4}-\d{2}-\d{2})/);
+            if (isoMatch) {
+              dateStr = isoMatch[1];
+            } else {
+              // Formato MM/DD/YYYY HH:mm o similar
+              const parsed = new Date(s);
+              if (!isNaN(parsed.getTime())) {
+                dateStr = parsed.toISOString().slice(0, 10);
+              }
+            }
+          }
+        }
+
+        if (dateStr) {
+          if (!porDia[dateStr]) {
+            porDia[dateStr] = { sesiones: 0, kwh: 0, ingresos: 0, usuarios: new Set() };
+          }
+          porDia[dateStr].sesiones++;
+          porDia[dateStr].kwh      += kwh;
+          porDia[dateStr].ingresos += (amount - idling);
+          if (member) porDia[dateStr].usuarios.add(member.toLowerCase());
+        }
       }
+    }
+
+    // ── Detectar último día de operación ────────────────────────────────────
+    const diasOrdenados = Object.keys(porDia).sort();
+    const ultimoDia     = diasOrdenados.length > 0
+      ? diasOrdenados[diasOrdenados.length - 1]
+      : null;
+
+    // ── KPIs del último día ──────────────────────────────────────────────────
+    let kpisUltimoDia = null;
+    if (ultimoDia && porDia[ultimoDia]) {
+      const d = porDia[ultimoDia];
+      kpisUltimoDia = {
+        total_sesiones:  d.sesiones,
+        usuarios_unicos: d.usuarios.size,
+        kwh_total:       Math.round(d.kwh * 100) / 100,
+        ingresos_netos:  Math.round(d.ingresos * 100) / 100,
+        tasa_ocupacion:  null,
+      };
     }
 
     // ── tasa_ocupacion: se calcula en el Dashboard (requiere capacidad instalada)
@@ -146,6 +213,10 @@ function extractKpis(buffer) {
     console.log(`  kWh total:       ${totalKwh.toFixed(2)}`);
     console.log(`  Ingresos netos:  ${totalIngresos.toFixed(2)}`);
     console.log(`  Tasa ocupación:  N/D (se calcula en el Dashboard)`);
+    console.log(`  Último día:      ${ultimoDia || 'No detectado (STARTED AT ausente)'}`);
+    if (kpisUltimoDia) {
+      console.log(`  KPIs último día: sesiones=${kpisUltimoDia.total_sesiones} kWh=${kpisUltimoDia.kwh_total} ingresos=${kpisUltimoDia.ingresos_netos}`);
+    }
 
     return {
       total_sesiones:  totalSesiones,
@@ -154,6 +225,8 @@ function extractKpis(buffer) {
       ingresos_netos:  Math.round(totalIngresos * 100) / 100,
       tasa_ocupacion:  tasaOcupacion,
       error:           null,
+      ultimo_dia:      ultimoDia,
+      kpis_ultimo_dia: kpisUltimoDia,
     };
 
   } catch (err) {
