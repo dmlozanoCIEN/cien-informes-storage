@@ -342,7 +342,17 @@ async function runPipeline(configEnvio) {
     if (kpis.error) log.warn(`KPIs con error parcial: ${kpis.error}`);
     else log.info(`KPIs: sesiones=${kpis.total_sesiones} | usuarios=${kpis.usuarios_unicos} | kWh=${kpis.kwh_total} | ingresos=${kpis.ingresos_netos} | ocupacion=${kpis.tasa_ocupacion ?? 'N/D'}%`);
 
+    // Último día de operación detectado en el Excel (para pre-filtrar dashboard y correo)
+    const ultimoDia    = kpis.ultimo_dia    || null;
+    const kpisCorreo   = kpis.kpis_ultimo_dia || kpis; // Usar KPIs del último día si están disponibles
+    if (ultimoDia) {
+      log.info(`Último día de operación: ${ultimoDia} | sesiones=${kpisCorreo.total_sesiones} kWh=${kpisCorreo.kwh_total} ingresos=${kpisCorreo.ingresos_netos}`);
+    } else {
+      log.warn(`No se detectó último día (columna STARTED AT ausente) — se usarán KPIs globales en el correo`);
+    }
+
     // PASO 3: Generar URL del dashboard apuntando al Excel original en R2/CDN
+    // Si se detectó el último día, se añade &day=YYYY-MM-DD para pre-filtrar el dashboard.
     log.info(`[2/4] Generando URL del informe...`);
     const { dashboardUrl } = generateReportUrl({
       aliadoId,
@@ -352,8 +362,9 @@ async function runPipeline(configEnvio) {
       fecha,
       dashboardBase: CONFIG.dashboardBaseUrl,
       claveAcceso,
+      ultimoDia,         // ← añade &day=YYYY-MM-DD si está disponible
     });
-    log.info(`URL dashboard: ${dashboardUrl.slice(0, 120)}...`);
+    log.info(`URL dashboard: ${dashboardUrl.slice(0, 150)}${dashboardUrl.length > 150 ? '...' : ''}`);
 
     // PASO 3b: Actualizar informe en NocoDB con URLs
     if (informeId) {
@@ -364,11 +375,14 @@ async function runPipeline(configEnvio) {
       } catch (e) { log.warn(`No se pudo actualizar URLs en NocoDB: ${e.message}`); }
     }
 
-    // PASO 4: Enviar correo con KPIs reales
-    log.info(`[3/4] Enviando correo via EmailJS...`);
+    // PASO 4: Enviar correo con KPIs del último día (o globales si no se detectó)
+    log.info(`[3/4] Enviando correo via EmailJS (KPIs de: ${ultimoDia || 'período completo'})...`);
     const send = await sendReportEmail({
       aliadoId, aliadoNombre, reportUuid,
-      urlDashboard: dashboardUrl, fecha, kpis, informeId,
+      urlDashboard: dashboardUrl, fecha,
+      kpis:         kpisCorreo,   // ← KPIs del último día si están disponibles
+      ultimoDia,                  // ← para mostrar la etiqueta de fecha en el correo
+      informeId,
       // Pasar contactos pre-cargados → send-report-email NO hace GET extra a NocoDB
       contactos: contactos.length ? contactos : null,
     });
