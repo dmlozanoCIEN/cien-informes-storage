@@ -1,14 +1,20 @@
 /**
  * pipeline/extract-kpis.js
  * ─────────────────────────────────────────────────────────────────────────────
- * Lee un buffer de Excel (.xlsx) y extrae los KPIs de operación CIEN:
- *   - total_sesiones   → número de filas válidas (columna "#")
- *   - usuarios_unicos  → valores únicos de "MEMBER NUMBER"
- *   - kwh_total        → suma de "CONSUMPTION (KWH)"
- *   - ingresos_netos   → suma de "AMOUNT (WITH TAXES)" - "IDLING FEE (WITH TAXES)"
- *   - tasa_ocupacion   → siempre null (se calcula en el Dashboard)
- *   - ultimo_dia       → 'YYYY-MM-DD' del último día con sesiones en "STARTED AT"
- *   - kpis_ultimo_dia  → mismos KPIs pero solo de ese último día
+ * Lee un buffer de Excel (.xlsx) y extrae los KPIs de operación CIEN.
+ *
+ * Columnas reales del Excel CIEN (confirmadas por log de diagnóstico):
+ *   TRANSACTION ID        → identificador de sesión (reemplaza "#")
+ *   MEMBER NUMBER         → identificador del usuario
+ *   CONSUMPTION (KWH)     → energía entregada
+ *   AMOUNT (WITH TAXES)   → ingreso bruto
+ *   IDLING FEE (WITH TAXES)→ cargo por tiempo de espera
+ *   STARTED AT            → fecha/hora inicio — formato "Aug 25, 2026, 7:29 PM"
+ *
+ * Retorna:
+ *   total_sesiones, usuarios_unicos, kwh_total, ingresos_netos,
+ *   tasa_ocupacion (null), error,
+ *   ultimo_dia ('YYYY-MM-DD'), kpis_ultimo_dia ({...})
  * ─────────────────────────────────────────────────────────────────────────────
  */
 
@@ -21,16 +27,12 @@ try {
   XLSX = null;
 }
 
-// ─── Función auxiliar: busca un valor en una fila por múltiples nombres ───────
-// Normaliza las claves del objeto fila a minúsculas para comparación
-// robusta independiente de cómo el Excel capitalice los encabezados.
+// ─── g(): busca un valor en una fila por múltiples nombres alternativos ───────
+// Normaliza a minúsculas + colapsa espacios múltiples para máxima compatibilidad
 function g(row, ...keys) {
-  // Construir mapa normalizado una sola vez
   const norm = {};
   for (const k of Object.keys(row)) {
-    // Normalizar: minúsculas + colapsar espacios múltiples
-    const kn = k.trim().toLowerCase().replace(/\s+/g, ' ');
-    norm[kn] = row[k];
+    norm[k.trim().toLowerCase().replace(/\s+/g, ' ')] = row[k];
   }
   for (const key of keys) {
     const kn = key.trim().toLowerCase().replace(/\s+/g, ' ');
@@ -40,36 +42,87 @@ function g(row, ...keys) {
   return null;
 }
 
-// ─── Parsear fecha desde celda de Excel ──────────────────────────────────────
-// Maneja: Date (cellDates:true), string ISO, string MM/DD/YYYY, número Excel serial
-function parseFecha(startedAt) {
-  if (!startedAt) return null;
+// ─── parseFecha(): convierte cualquier formato de fecha a 'YYYY-MM-DD' ────────
+// Maneja los formatos reales del Excel CIEN:
+//   "Aug 25, 2026, 7:29 PM"  → "2026-08-25"
+//   "2026-08-25 19:29:00"    → "2026-08-25"
+//   Date object (cellDates)  → "2026-08-25"
+//   número serial Excel       → "2026-08-25"
+function parseFecha(raw) {
+  if (raw === null || raw === undefined || raw === '') return null;
+
   try {
-    // Si SheetJS ya lo convirtió a Date
-    if (startedAt instanceof Date) {
-      if (!isNaN(startedAt.getTime())) return startedAt.toISOString().slice(0, 10);
+    // Caso 1: ya es un objeto Date (SheetJS cellDates:true)
+    if (raw instanceof Date) {
+      if (!isNaN(raw.getTime())) return raw.toISOString().slice(0, 10);
       return null;
     }
-    // Si es número (Excel date serial)
-    if (typeof startedAt === 'number') {
-      // XLSX puede devolver número serial — convertir
-      const d = XLSX ? XLSX.SSF.parse_date_code(startedAt) : null;
-      if (d) {
-        const dt = new Date(d.y, d.m - 1, d.d);
-        return dt.toISOString().slice(0, 10);
+
+    // Caso 2: número serial Excel (ej: 46295.81)
+    if (typeof raw === 'number') {
+      // Intentar con XLSX si está disponible
+      if (XLSX && XLSX.SSF && XLSX.SSF.parse_date_code) {
+        try {
+          const d = XLSX.SSF.parse_date_code(raw);
+          if (d && d.y) {
+            const dt = new Date(Date.UTC(d.y, d.m - 1, d.d));
+            return dt.toISOString().slice(0, 10);
+          }
+        } catch (_) {}
+      }
+      // Fallback: tratar como epoch ms si es un número grande
+      if (raw > 40000 && raw < 60000) {
+        // Rango de seriales Excel modernos (aprox 2009-2064)
+        const epoch = (raw - 25569) * 86400 * 1000;
+        const dt = new Date(epoch);
+        if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 10);
       }
       return null;
     }
-    const s = String(startedAt).trim();
+
+    // Caso 3: string — intentar múltiples formatos
+    const s = String(raw).trim();
     if (!s) return null;
 
-    // ISO: 'YYYY-MM-DD' o 'YYYY-MM-DDTHH:mm...'
+    // 3a. ISO directo: "2026-08-25" o "2026-08-25T19:29:00..."
     const isoMatch = s.match(/^(\d{4}-\d{2}-\d{2})/);
     if (isoMatch) return isoMatch[1];
 
-    // DD/MM/YYYY HH:mm o MM/DD/YYYY HH:mm — intentar con Date
-    const parsed = new Date(s);
-    if (!isNaN(parsed.getTime())) return parsed.toISOString().slice(0, 10);
+    // 3b. Formato CIEN real: "Aug 25, 2026, 7:29 PM"
+    //     Meses en inglés abreviados
+    const MESES_EN = {
+      jan:1, feb:2, mar:3, apr:4, may:5, jun:6,
+      jul:7, aug:8, sep:9, oct:10, nov:11, dec:12,
+    };
+    // Patrón: "MMM D, YYYY" o "MMM D, YYYY, H:MM AM/PM"
+    const mmmMatch = s.match(/^([A-Za-z]{3})\s+(\d{1,2}),\s*(\d{4})/);
+    if (mmmMatch) {
+      const mes = MESES_EN[mmmMatch[1].toLowerCase()];
+      const dia = parseInt(mmmMatch[2], 10);
+      const año = parseInt(mmmMatch[3], 10);
+      if (mes && dia && año) {
+        const dt = new Date(Date.UTC(año, mes - 1, dia));
+        if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 10);
+      }
+    }
+
+    // 3c. Formato DD/MM/YYYY o MM/DD/YYYY
+    const slashMatch = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if (slashMatch) {
+      // Intentar ambos órdenes
+      const [, a, b, año] = slashMatch;
+      // Si el primer número > 12 es día/mes/año
+      const dia = parseInt(a, 10) > 12 ? parseInt(a, 10) : parseInt(b, 10);
+      const mes = parseInt(a, 10) > 12 ? parseInt(b, 10) : parseInt(a, 10);
+      if (mes >= 1 && mes <= 12 && dia >= 1 && dia <= 31) {
+        const dt = new Date(Date.UTC(parseInt(año, 10), mes - 1, dia));
+        if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 10);
+      }
+    }
+
+    // 3d. Último recurso: dejar que Date lo parsee (locale-dependent, menos fiable)
+    const dt = new Date(s);
+    if (!isNaN(dt.getTime())) return dt.toISOString().slice(0, 10);
 
     return null;
   } catch (_) {
@@ -77,24 +130,8 @@ function parseFecha(startedAt) {
   }
 }
 
-// ─── Función principal ────────────────────────────────────────────────────────
+// ─── extractKpis(): función principal ────────────────────────────────────────
 
-/**
- * Extrae KPIs de operación desde un buffer de Excel.
- *
- * @param {Buffer} buffer   Buffer del archivo .xlsx
- * @returns {object}
- *   {
- *     total_sesiones:   number,
- *     usuarios_unicos:  number,
- *     kwh_total:        number,
- *     ingresos_netos:   number,
- *     tasa_ocupacion:   null,
- *     error:            string|null,
- *     ultimo_dia:       string|null,   // 'YYYY-MM-DD'
- *     kpis_ultimo_dia:  object|null,   // KPIs solo del último día
- *   }
- */
 function extractKpis(buffer) {
   const empty = {
     total_sesiones: 0, usuarios_unicos: 0,
@@ -107,97 +144,96 @@ function extractKpis(buffer) {
   }
 
   try {
-    // Leer workbook desde buffer
-    // cellDates:true para que SheetJS convierta fechas a objetos Date
     const wb = XLSX.read(buffer, { type: 'buffer', cellDates: true });
 
     let totalSesiones = 0;
     let totalKwh      = 0;
     let totalIngresos = 0;
     const usuariosSet = new Set();
+    const porDia      = {}; // { 'YYYY-MM-DD': { sesiones, kwh, ingresos, usuarios:Set } }
 
-    // Acumuladores por día { 'YYYY-MM-DD': { sesiones, kwh, ingresos, usuarios:Set } }
-    const porDia = {};
-
-    // ── Procesar cada hoja (una por mes normalmente) ──────────────────────────
     for (const sheetName of wb.SheetNames) {
       const ws   = wb.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
 
-      // ── Log de diagnóstico: columnas de la primera fila ──────────────────
-      if (rows.length > 0) {
-        const cols = Object.keys(rows[0]);
-        console.log(`[extract-kpis] Hoja "${sheetName}" — ${rows.length} filas — columnas: ${JSON.stringify(cols)}`);
-
-        // Mostrar valores de la primera fila para diagnóstico de nombres exactos
-        const primeraFila = {};
-        cols.forEach(c => {
-          const v = rows[0][c];
-          primeraFila[c] = v instanceof Date ? v.toISOString() : v;
-        });
-        console.log(`[extract-kpis] Primera fila (muestra): ${JSON.stringify(primeraFila)}`);
-      } else {
-        console.log(`[extract-kpis] Hoja "${sheetName}" — vacía (0 filas)`);
+      if (rows.length === 0) {
+        console.log(`[extract-kpis] Hoja "${sheetName}" — vacía`);
         continue;
       }
 
-      let filasValidas = 0;
+      // Log de diagnóstico: columnas y primera fila
+      const cols = Object.keys(rows[0]);
+      console.log(`[extract-kpis] Hoja "${sheetName}" — ${rows.length} filas — columnas: ${JSON.stringify(cols)}`);
+      const muestraFila = {};
+      cols.forEach(c => {
+        const v = rows[0][c];
+        muestraFila[c] = v instanceof Date ? v.toISOString() : v;
+      });
+      console.log(`[extract-kpis] Primera fila: ${JSON.stringify(muestraFila)}`);
+
+      let filasValidas  = 0;
       let filasConFecha = 0;
+      let fechasFallidas = 0;
 
       for (const row of rows) {
-        // ── Filtro de fila válida: debe tener un número en la columna "#" ──
-        // Esto descarta encabezados repetidos y filas vacías
-        const numSesion = g(row,
-          '#', 'no.', 'n°', 'num', 'number', 'nro', 'numero', 'item', 'seq',
+
+        // ── FILTRO: fila válida = tiene TRANSACTION ID o "#" numérico ────────
+        // El Excel CIEN usa "TRANSACTION ID" como columna de secuencia,
+        // no "#". Buscamos cualquiera de las dos.
+        const txId = g(row,
+          'transaction id', 'transaction_id', 'txn id', 'txn_id',
+          'charging session txn id',
+          '#', 'no.', 'n°', 'num', 'numero', 'item', 'seq', 'id',
         );
-        // Aceptar tanto número como string numérico
-        const numVal = numSesion !== null ? Number(numSesion) : NaN;
-        if (isNaN(numVal) || numVal <= 0) continue;
+        // La fila es válida si tiene un TRANSACTION ID numérico (> 0)
+        // o una cadena no vacía
+        if (txId === null || txId === undefined) continue;
+        const txNum = Number(txId);
+        // Aceptar: número positivo, o string no-vacío que no sea encabezado
+        if (typeof txId === 'number' && (isNaN(txNum) || txNum <= 0)) continue;
+        if (typeof txId === 'string' && txId.trim() === '') continue;
 
         filasValidas++;
         totalSesiones++;
 
-        // ── MEMBER NUMBER ────────────────────────────────────────────────────
+        // ── MEMBER NUMBER ─────────────────────────────────────────────────────
         const member = String(
           g(row,
             'member number', 'member_number', 'membernumber',
-            'member', 'user', 'phone', 'customer',
-            'usuario', 'cliente', 'telefono',
+            'member name', 'member_name',
+            'member', 'user', 'phone', 'customer', 'usuario', 'cliente',
           ) || ''
         ).trim();
         if (member) usuariosSet.add(member.toLowerCase());
 
-        // ── CONSUMPTION (KWH) ────────────────────────────────────────────────
+        // ── CONSUMPTION (KWH) ─────────────────────────────────────────────────
         const kwh = parseFloat(
           g(row,
             'consumption (kwh)', 'consumption(kwh)',
-            'consumption', 'kwh', 'energy (kwh)', 'energy_kwh',
-            'energia', 'energia (kwh)',
+            'consumption', 'kwh', 'energy (kwh)', 'energy_kwh', 'energia',
           )
         ) || 0;
         totalKwh += kwh;
 
-        // ── AMOUNT (WITH TAXES) ──────────────────────────────────────────────
+        // ── AMOUNT (WITH TAXES) ───────────────────────────────────────────────
         const amount = parseFloat(
           g(row,
             'amount (with taxes)', 'amount(with taxes)',
-            'amount', 'total', 'revenue', 'monto',
-            'valor', 'valor total', 'total con impuestos',
+            'amount', 'total', 'revenue', 'monto', 'valor',
           )
         ) || 0;
 
-        // ── IDLING FEE (WITH TAXES) ──────────────────────────────────────────
+        // ── IDLING FEE (WITH TAXES) ───────────────────────────────────────────
         const idling = parseFloat(
           g(row,
             'idling fee (with taxes)', 'idling fee(with taxes)',
-            'idling fee', 'idling_fee', 'idling',
-            'cargo por espera', 'fee',
+            'idling fee', 'idling_fee', 'idling', 'cargo por espera',
           )
         ) || 0;
 
         totalIngresos += (amount - idling);
 
-        // ── STARTED AT → fecha del día ───────────────────────────────────────
+        // ── STARTED AT → fecha del día ────────────────────────────────────────
         const startedAtRaw = g(row,
           'started at', 'started_at', 'start at', 'start_at',
           'start time', 'start_time', 'start date', 'start_date',
@@ -216,19 +252,24 @@ function extractKpis(buffer) {
           porDia[dateStr].kwh      += kwh;
           porDia[dateStr].ingresos += (amount - idling);
           if (member) porDia[dateStr].usuarios.add(member.toLowerCase());
+        } else if (startedAtRaw !== null) {
+          fechasFallidas++;
+          // Log de la primera fecha que falla para diagnóstico
+          if (fechasFallidas === 1) {
+            console.log(`[extract-kpis] ⚠️  Fecha no parseada (primera ocurrencia): "${startedAtRaw}" (tipo: ${typeof startedAtRaw})`);
+          }
         }
       }
 
-      console.log(`[extract-kpis] Hoja "${sheetName}" → filas válidas: ${filasValidas} | con fecha: ${filasConFecha}`);
+      console.log(`[extract-kpis] Hoja "${sheetName}" → válidas:${filasValidas} | con_fecha:${filasConFecha} | fechas_fallidas:${fechasFallidas}`);
     }
 
-    // ── Detectar último día de operación ─────────────────────────────────────
+    // ── Último día y KPIs del último día ──────────────────────────────────────
     const diasOrdenados = Object.keys(porDia).sort();
     const ultimoDia     = diasOrdenados.length > 0
       ? diasOrdenados[diasOrdenados.length - 1]
       : null;
 
-    // ── KPIs del último día ───────────────────────────────────────────────────
     let kpisUltimoDia = null;
     if (ultimoDia && porDia[ultimoDia]) {
       const d = porDia[ultimoDia];
@@ -241,21 +282,18 @@ function extractKpis(buffer) {
       };
     }
 
-    // ── Resumen de diagnóstico ────────────────────────────────────────────────
-    console.log(`[extract-kpis] ═══ RESUMEN GLOBAL ════════════════════════════`);
-    console.log(`  Hojas procesadas:  ${wb.SheetNames.length} (${wb.SheetNames.join(', ')})`);
-    console.log(`  Sesiones total:    ${totalSesiones}`);
-    console.log(`  Usuarios únicos:   ${usuariosSet.size}`);
-    console.log(`  kWh total:         ${totalKwh.toFixed(2)}`);
-    console.log(`  Ingresos netos:    ${totalIngresos.toFixed(2)}`);
-    console.log(`  Días con datos:    ${diasOrdenados.length} [${diasOrdenados.slice(-5).join(', ')}${diasOrdenados.length > 5 ? '...' : ''}]`);
-    console.log(`  Último día:        ${ultimoDia || 'NO DETECTADO — columna STARTED AT no encontrada o sin fechas válidas'}`);
+    // ── Resumen ───────────────────────────────────────────────────────────────
+    console.log(`[extract-kpis] ═══ RESUMEN ═════════════════════════════════`);
+    console.log(`  Sesiones:        ${totalSesiones}`);
+    console.log(`  Usuarios únicos: ${usuariosSet.size}`);
+    console.log(`  kWh total:       ${totalKwh.toFixed(2)}`);
+    console.log(`  Ingresos netos:  ${totalIngresos.toFixed(2)}`);
+    console.log(`  Días detectados: ${diasOrdenados.length} [últimos: ${diasOrdenados.slice(-3).join(', ')}]`);
+    console.log(`  Último día:      ${ultimoDia || 'NO DETECTADO'}`);
     if (kpisUltimoDia) {
-      console.log(`  KPIs último día:   sesiones=${kpisUltimoDia.total_sesiones} | usuarios=${kpisUltimoDia.usuarios_unicos} | kWh=${kpisUltimoDia.kwh_total} | ingresos=${kpisUltimoDia.ingresos_netos}`);
-    } else {
-      console.log(`  KPIs último día:   NO DISPONIBLES (sin fechas → correo mostrará KPIs globales)`);
+      console.log(`  KPIs último día: sesiones=${kpisUltimoDia.total_sesiones} | usuarios=${kpisUltimoDia.usuarios_unicos} | kWh=${kpisUltimoDia.kwh_total} | ingresos=${kpisUltimoDia.ingresos_netos}`);
     }
-    console.log(`[extract-kpis] ════════════════════════════════════════════════`);
+    console.log(`[extract-kpis] ════════════════════════════════════════════`);
 
     return {
       total_sesiones:  totalSesiones,
@@ -269,7 +307,7 @@ function extractKpis(buffer) {
     };
 
   } catch (err) {
-    console.error(`[extract-kpis] ❌ Error leyendo Excel: ${err.message}`);
+    console.error(`[extract-kpis] ❌ Error: ${err.message}`);
     console.error(err.stack);
     return { ...empty, error: err.message };
   }
