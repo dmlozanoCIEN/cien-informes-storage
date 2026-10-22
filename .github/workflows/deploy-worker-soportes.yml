@@ -50,10 +50,13 @@ jobs:
       - name: 📥 Checkout código
         uses: actions/checkout@v4
 
-      - name: ⚙️ Setup Node.js 20
+      # Wrangler 4.x exige Node >= 22. Con Node 20 falla con:
+      #   "Wrangler requires at least Node.js v22.0.0"
+      # Se fija 22 (LTS) explícitamente para que no dependa del default del runner.
+      - name: ⚙️ Setup Node.js 22
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       # ── 1. Ensayo: valida imports y empaquetado sin publicar ────────────────
       - name: 🧪 Ensayo (dry-run, no publica)
@@ -63,7 +66,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          npx --yes wrangler@latest deploy -c api/wrangler.toml --dry-run
+          node -v
+          npx --yes wrangler@4 deploy -c api/wrangler.toml --dry-run
           {
             echo "## 🧪 Ensayo correcto"
             echo ""
@@ -79,7 +83,8 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
         run: |
           set -euo pipefail
-          npx --yes wrangler@latest deploy -c api/wrangler.toml 2>&1 | tee deploy.log
+          node -v
+          npx --yes wrangler@4 deploy -c api/wrangler.toml 2>&1 | tee deploy.log
 
           URL="$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' deploy.log | head -n1 || true)"
           echo "URL_DEL_WORKER=${URL}" >> "$GITHUB_ENV"
@@ -123,7 +128,7 @@ jobs:
               echo "::warning::El secreto ${nombre} está vacío en GitHub; se omite."
               return 0
             fi
-            printf '%s' "${valor}" | npx --yes wrangler@latest secret put "${nombre}" -c api/wrangler.toml
+            printf '%s' "${valor}" | npx --yes wrangler@4 secret put "${nombre}" -c api/wrangler.toml
             echo "Secreto ${nombre} cargado."
           }
 
@@ -132,7 +137,7 @@ jobs:
           cargar SOPORTES_CORREO_DESARROLLADOR    "${VAL_SOPORTES_CORREO_DESARROLLADOR}"
 
           echo "### Secretos cargados"
-          npx --yes wrangler@latest secret list -c api/wrangler.toml
+          npx --yes wrangler@4 secret list -c api/wrangler.toml
 
       # ── 4. Verificación en caliente ────────────────────────────────────────
       - name: ✅ Verificar que responde (flag apagado)
