@@ -1,0 +1,158 @@
+name: Publicar Worker cien-soportes
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Publica el Worker `cien-soportes` (api/soportes.js) SIN terminal en tu PC.
+#
+# Se dispara SOLO con el botón:
+#   GitHub → Actions → "Publicar Worker cien-soportes" → Run workflow
+#
+# Este workflow:
+#   1. (opcional) valida el empaquetado con --dry-run y NO publica nada
+#   2. publica el Worker en Cloudflare
+#   3. carga los 3 secretos del Worker
+#   4. imprime la URL real en el resumen del job
+#
+# NO toca el sitio (app.cien.app) ni el workflow `cien-scheduler.yml`.
+# El módulo sigue APAGADO: ENABLE_SOPORTES_ACEPTACION = "false" en api/wrangler.toml
+#
+# Secretos necesarios en el repositorio
+# (Settings → Secrets and variables → Actions → New repository secret):
+#   CF_API_TOKEN                 → Cloudflare API Token con permiso
+#                                  "Edit Cloudflare Workers"
+#   CF_ACCOUNT_ID                → Cloudflare → Workers & Pages → Account ID
+#   NOCODB_TOKEN                 → NocoDB → Account Settings → Tokens de API (nc_pat_…)
+#   SOPORTES_SESION_SECRET       → 64 caracteres hex aleatorios
+#   SOPORTES_CORREO_DESARROLLADOR→ correo de respaldo para la notificación
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Solo validar el empaquetado (no publica nada)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-worker-soportes
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Wrangler deploy (cien-soportes)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 Checkout código
+        uses: actions/checkout@v4
+
+      - name: ⚙️ Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ── 1. Ensayo: valida imports y empaquetado sin publicar ────────────────
+      - name: 🧪 Ensayo (dry-run, no publica)
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@latest deploy -c api/wrangler.toml --dry-run
+          {
+            echo "## 🧪 Ensayo correcto"
+            echo ""
+            echo "El paquete se armó sin errores. No se publicó nada."
+            echo "Ejecuta de nuevo con \`dry_run = false\` para publicar."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 2. Publicar el Worker ──────────────────────────────────────────────
+      - name: 🚀 Publicar Worker
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN:  ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CF_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@latest deploy -c api/wrangler.toml 2>&1 | tee deploy.log
+
+          URL="$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' deploy.log | head -n1 || true)"
+          echo "URL_DEL_WORKER=${URL}" >> "$GITHUB_ENV"
+
+          {
+            echo "## ✅ Worker publicado"
+            echo ""
+            if [ -n "$URL" ]; then
+              echo "**URL real del Worker:**"
+              echo ""
+              echo '```'
+              echo "$URL"
+              echo '```'
+              echo ""
+              echo "Cópiala (sin barra final) y pégala en \`js/config.js\` →"
+              echo "\`SOPORTES_WORKER_URL\`, reemplazando \`…REEMPLAZAR…\`."
+            else
+              echo "⚠️ No se pudo leer la URL de la salida. Ábrela en Cloudflare:"
+              echo "Workers & Pages → \`cien-soportes\`."
+            fi
+            echo ""
+            echo "Estado del módulo: **APAGADO** (\`ENABLE_SOPORTES_ACEPTACION=false\`)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── 3. Cargar los secretos del Worker ──────────────────────────────────
+      # Van DESPUÉS del deploy porque el Worker debe existir primero.
+      # `printf | wrangler secret put` evita que el valor quede en el historial.
+      - name: 🔐 Cargar secretos del Worker
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN:            ${{ secrets.CF_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID:           ${{ secrets.CF_ACCOUNT_ID }}
+          VAL_NOCODB_TOKEN:                ${{ secrets.NOCODB_TOKEN }}
+          VAL_SOPORTES_SESION_SECRET:      ${{ secrets.SOPORTES_SESION_SECRET }}
+          VAL_SOPORTES_CORREO_DESARROLLADOR: ${{ secrets.SOPORTES_CORREO_DESARROLLADOR }}
+        run: |
+          set -euo pipefail
+          cargar() {
+            local nombre="$1" valor="$2"
+            if [ -z "${valor}" ]; then
+              echo "::warning::El secreto ${nombre} está vacío en GitHub; se omite."
+              return 0
+            fi
+            printf '%s' "${valor}" | npx --yes wrangler@latest secret put "${nombre}" -c api/wrangler.toml
+            echo "Secreto ${nombre} cargado."
+          }
+
+          cargar NOCODB_TOKEN                    "${VAL_NOCODB_TOKEN}"
+          cargar SOPORTES_SESION_SECRET           "${VAL_SOPORTES_SESION_SECRET}"
+          cargar SOPORTES_CORREO_DESARROLLADOR    "${VAL_SOPORTES_CORREO_DESARROLLADOR}"
+
+          echo "### Secretos cargados"
+          npx --yes wrangler@latest secret list -c api/wrangler.toml
+
+      # ── 4. Verificación en caliente ────────────────────────────────────────
+      - name: ✅ Verificar que responde (flag apagado)
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${URL_DEL_WORKER:-}" ]; then
+            echo "Sin URL detectada; se omite la verificación."
+            exit 0
+          fi
+          echo "Consultando ${URL_DEL_WORKER}/?accion=flag"
+          RESPUESTA="$(curl -sS "${URL_DEL_WORKER}/?accion=flag" || true)"
+          echo "Respuesta: ${RESPUESTA}"
+
+          CODIGO_ESTADO="$(curl -s -o /dev/null -w '%{http_code}' "${URL_DEL_WORKER}/?accion=estado&token=prueba" || true)"
+          echo "?accion=estado → HTTP ${CODIGO_ESTADO} (debe ser 404 con el flag apagado)"
+
+          {
+            echo ""
+            echo "### Verificación"
+            echo "- \`?accion=flag\` → \`${RESPUESTA}\`"
+            echo "- \`?accion=estado\` → HTTP ${CODIGO_ESTADO} (esperado 404)"
+          } >> "$GITHUB_STEP_SUMMARY"
