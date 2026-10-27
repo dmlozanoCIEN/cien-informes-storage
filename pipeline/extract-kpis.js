@@ -27,8 +27,10 @@ try {
   XLSX = null;
 }
 
-// Cálculo de la tasa de ocupación (módulo aparte para poder probarlo aislado).
-const { parseDuracionMin, parseHoraMinuto, calcularOcupacion, VENTANA_OPERACION_MIN } = require('./ocupacion');
+/* Cálculo de la tasa de ocupación (módulo aparte para poder probarlo aislado).
+   Usa el método de ENERGÍA, idéntico al dashboard consolidado: el número del
+   correo y el del informe deben coincidir siempre. */
+const { calcularOcupacion, VENTANA_OPERACION_HORAS } = require('./ocupacion');
 
 // ─── g(): busca un valor en una fila por múltiples nombres alternativos ───────
 // Normaliza a minúsculas + colapsa espacios múltiples para máxima compatibilidad
@@ -156,11 +158,11 @@ function extractKpis(buffer) {
     const porDia      = {}; // { 'YYYY-MM-DD': { sesiones, kwh, ingresos, usuarios:Set } }
 
     /* Sesiones normalizadas para el cálculo de ocupación.
-       Aditivo: NO altera los totales de arriba. Se deduplican por transacción
-       porque el mismo Excel puede traer hojas solapadas (Export + Sheet1) y la
-       misma sesión no debe contarse dos veces en la ocupación. */
+       Aditivo: NO altera los totales de arriba.
+       Sin deduplicar a propósito: el dashboard consolidado tampoco deduplica y
+       se lee hoja por hoja, así que replicar ese comportamiento es la única
+       forma de que ambos números coincidan. */
     const sesionesOcupacion = [];
-    const _vistosOcupacion  = new Set();
 
     for (const sheetName of wb.SheetNames) {
       const ws   = wb.Sheets[sheetName];
@@ -266,58 +268,23 @@ function extractKpis(buffer) {
           }
         }
 
-        // ── OCUPACIÓN: duración de la sesión por cargador (bloque aditivo) ────
-        // Se guarda lo mínimo para calcular la tasa al final: qué cargador,
-        // qué día, cuánto estuvo ocupado y a qué hora terminó.
-        if (dateStr) {
-          const evse = String(g(row,
-            'evse id', 'evse_id', 'evse name', 'evse_name',
-            'cargador', 'charger', 'punto de carga',
+        // ── OCUPACIÓN: kWh por cargador (bloque aditivo) ─────────────────────
+        // Sólo se guarda lo que necesita el método de energía: qué cargador,
+        // qué día y cuántos kWh entregó. La potencia se deduce del nombre del
+        // cargador dentro de pipeline/ocupacion.js, igual que en el dashboard.
+        if (dateStr && kwh > 0) {
+          const evseId   = String(g(row, 'evse id', 'evse_id') || '').trim();
+          const evseName = String(g(row,
+            'evse name', 'evse_name', 'cargador', 'charger', 'punto de carga',
           ) || '').trim();
 
-          // CHARGING DURATION = entregando energía.
-          // IDLING DURATION   = conectado sin cargar; el vehículo sigue ocupando
-          //                     el cargador, por eso también cuenta como ocupación.
-          const durCarga  = parseDuracionMin(g(row,
-            'charging duration', 'charging_duration',
-            'duracion de carga', 'duración de carga', 'tiempo de carga',
-          ));
-          const durIdling = parseDuracionMin(g(row,
-            'idling duration', 'idling_duration',
-            'duracion de espera', 'duración de espera', 'tiempo de espera',
-          )) || 0;
-
-          const ocupadoMin = (durCarga !== null ? durCarga : 0) + durIdling;
-
-          if (evse && ocupadoMin > 0) {
-            const txn = String(g(row,
-              'charging session txn id', 'transaction id', 'txn id',
-              'id de transaccion', 'id de transacción',
-            ) || '').trim();
-
-            const claveDup = txn
-              ? `${dateStr}|${txn}`
-              : `${dateStr}|${evse}|${startedAtRaw}|${ocupadoMin}`;
-
-            if (!_vistosOcupacion.has(claveDup)) {
-              _vistosOcupacion.add(claveDup);
-
-              // Hora de fin: ENDED AT / PLUGIN END; si no viniera, se deduce
-              // sumando la duración a la hora de inicio.
-              const startMin = parseHoraMinuto(startedAtRaw);
-              let   endMin   = parseHoraMinuto(g(row,
-                'ended at', 'ended_at', 'plugin end', 'plugin_end',
-                'fecha fin', 'fin', 'end time', 'end_time',
-              ));
-              if (startMin !== null && endMin !== null && endMin < startMin) {
-                endMin += 1440; // la sesión cruza la medianoche
-              }
-              if (endMin === null && startMin !== null) {
-                endMin = startMin + ocupadoMin;
-              }
-
-              sesionesOcupacion.push({ evse, fecha: dateStr, startMin, endMin, ocupadoMin });
-            }
+          if (evseId || evseName) {
+            sesionesOcupacion.push({
+              evse: evseId,
+              evseName,
+              fecha: dateStr,
+              kwh,
+            });
           }
         }
       }
@@ -326,13 +293,11 @@ function extractKpis(buffer) {
     }
 
     // ── TASA DE OCUPACIÓN (aditivo) ───────────────────────────────────────────
-    // Σ duraciones ÷ (nº de cargadores distintos × jornada operativa) × 100.
-    // La ventana es de 15 HORAS (900 min), no 24 h: se mide qué parte de la
-    // jornada operativa estuvo ocupado cada cargador. El último día del archivo
-    // se acota a la hora de la última sesión, porque el Excel se exporta antes
-    // de que termine la jornada.
+    // Σ kWh entregados ÷ Σ (potencia kW × 15 h × días activo) × 100.
+    // Es el MISMO método que el dashboard consolidado (occupancyOf()), no una
+    // aproximación: la jornada de 15 h multiplica la potencia, no el tiempo.
     const ocupacion = calcularOcupacion(sesionesOcupacion, {
-      ventanaCompletaMin: VENTANA_OPERACION_MIN,
+      ventanaHoras: VENTANA_OPERACION_HORAS,
     });
 
     // ── Último día y KPIs del último día ──────────────────────────────────────
@@ -370,11 +335,17 @@ function extractKpis(buffer) {
 
     // ── Diagnóstico de ocupación ──────────────────────────────────────────────
     if (ocupacion.tasa === null) {
-      console.log(`  Ocupación:        NO CALCULABLE (faltan EVSE ID o CHARGING DURATION)`);
+      console.log(`  Ocupación:        NO CALCULABLE (ningún cargador con potencia en el nombre)`);
     } else {
-      console.log(`  Ocupación período: ${ocupacion.tasa}% (${ocupacion.evses} cargador(es), ${ocupacion.ocupadoMin} de ${ocupacion.disponiblesMin} min — jornada ${VENTANA_OPERACION_MIN / 60} h)`);
+      console.log(`  Ocupación período: ${ocupacion.tasa}% ` +
+        `(${ocupacion.entregadoKwh} de ${ocupacion.capacidadKwh} kWh — ` +
+        `${ocupacion.conPotencia} cargador(es) con potencia, jornada ${VENTANA_OPERACION_HORAS} h)`);
+      if (ocupacion.sinPotencia > 0) {
+        console.log(`    ⚠ ${ocupacion.sinPotencia} cargador(es) sin potencia en el nombre — excluidos del cálculo`);
+      }
       ocupacion.detalle.forEach(d => {
-        console.log(`    · ${d.fecha}${d.diaCorte ? ' (día en curso, ventana ' + d.ventanaMin + ' min)' : ''}: ${d.tasa}% — ${d.sesiones} sesión(es), ${d.evses} EVSE`);
+        console.log(`    · ${d.fecha}: ${d.tasa}% — ${d.entregadoKwh} de ${d.capacidadKwh} kWh, ` +
+          `${d.conPotencia} cargador(es)`);
       });
     }
     console.log(`[extract-kpis] ════════════════════════════════════════════`);
