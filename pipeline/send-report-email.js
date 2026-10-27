@@ -28,9 +28,9 @@ const https = require('https');
 const CONFIG = {
   // EmailJS — claves del proyecto (del js/config.js existente)
   emailjsApiUrl:   'https://api.emailjs.com/api/v1.0/email/send',
-  serviceId:       process.env.EMAILJS_SERVICE_ID  || 'service_nndjw6q',
+  serviceId:       process.env.EMAILJS_SERVICE_ID  || 'service_jb9msan',
   templateId:      process.env.EMAILJS_TEMPLATE_ID || 'template_xx6ptyn',
-  publicKey:       process.env.EMAILJS_PUBLIC_KEY  || '0jOVta13ChggBuK11',
+  publicKey:       process.env.EMAILJS_PUBLIC_KEY  || 'YgxsExDPLHFff0odM',
   privateKey:      process.env.EMAILJS_PRIVATE_KEY || '',  // REQUERIDO para HTTP API
 
   // NocoDB
@@ -239,12 +239,26 @@ function formatKpisForEmail(kpis = {}) {
   const ingresos  = kpis.ingresos_netos  ?? kpis.ingresosNetos   ?? null;
   const ocupacion = kpis.tasa_ocupacion  ?? kpis.tasaOcupacion   ?? null;
 
+  /* El valor llega ya como porcentaje (p. ej. 42.7). Se comprueba que sea un
+     número de verdad: si llegara un texto o un null, se mantiene el fallback
+     anterior ("Ver dashboard") en lugar de pintar un "NaN%". */
+  const ocupNum   = (ocupacion === null || ocupacion === undefined || ocupacion === '')
+    ? null
+    : Number(ocupacion);
+  const ocupValida = ocupNum !== null && isFinite(ocupNum);
+  const ocupPct    = ocupValida ? Math.min(100, Math.max(0, ocupNum)) : null;
+
   return {
     total_sesiones:  sesiones  !== null ? fmt(sesiones)            : '—',
     usuarios_unicos: usuarios  !== null ? fmt(usuarios)            : '—',
     kwh_total:       kwh       !== null ? fmt(kwh, 1) + ' kWh'    : '—',
     ingresos_netos:  ingresos  !== null ? '$' + fmt(ingresos)      : '—',
-    tasa_ocupacion:  ocupacion !== null ? Number(ocupacion).toFixed(1) + '%' : 'Ver dashboard',
+    tasa_ocupacion:  ocupPct   !== null ? ocupPct.toFixed(1) + '%' : 'Ver dashboard',
+    /* Aditivo: número sin el símbolo %, para poder usarlo como ancho de la
+       barra de progreso del template (width: {{tasa_ocupacion_pct}}%).
+       Sin dato se envía 0, así la barra aparece vacía en vez de al 70 % fijo. */
+    tasa_ocupacion_pct: ocupPct !== null ? Math.round(ocupPct) : 0,
+    tasa_ocupacion_num: ocupPct !== null ? ocupPct : null,
   };
 }
 
@@ -397,6 +411,10 @@ async function sendReportEmail({
       kwh_total:       kpisFormateados.kwh_total,
       ingresos_netos:  kpisFormateados.ingresos_netos,
       tasa_ocupacion:  kpisFormateados.tasa_ocupacion,
+      /* Aditivo: número sin % para el ancho de la barra del template
+         (width: {{tasa_ocupacion_pct}}%). Sin dato vale 0, no el 70 fijo. */
+      tasa_ocupacion_pct: kpisFormateados.tasa_ocupacion_pct,
+      tasa_ocupacion_num: kpisFormateados.tasa_ocupacion_num,
 
       // Etiqueta del período/día al que pertenecen los KPIs mostrados en el correo
       // Si se pasó ultimoDia, muestra la fecha exacta; si no, muestra el período del informe.

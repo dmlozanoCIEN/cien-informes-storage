@@ -27,6 +27,9 @@ try {
   XLSX = null;
 }
 
+// Cálculo de la tasa de ocupación (módulo aparte para poder probarlo aislado).
+const { parseDuracionMin, parseHoraMinuto, calcularOcupacion, VENTANA_OPERACION_MIN } = require('./ocupacion');
+
 // ─── g(): busca un valor en una fila por múltiples nombres alternativos ───────
 // Normaliza a minúsculas + colapsa espacios múltiples para máxima compatibilidad
 function g(row, ...keys) {
@@ -152,6 +155,13 @@ function extractKpis(buffer) {
     const usuariosSet = new Set();
     const porDia      = {}; // { 'YYYY-MM-DD': { sesiones, kwh, ingresos, usuarios:Set } }
 
+    /* Sesiones normalizadas para el cálculo de ocupación.
+       Aditivo: NO altera los totales de arriba. Se deduplican por transacción
+       porque el mismo Excel puede traer hojas solapadas (Export + Sheet1) y la
+       misma sesión no debe contarse dos veces en la ocupación. */
+    const sesionesOcupacion = [];
+    const _vistosOcupacion  = new Set();
+
     for (const sheetName of wb.SheetNames) {
       const ws   = wb.Sheets[sheetName];
       const rows = XLSX.utils.sheet_to_json(ws, { defval: null });
@@ -177,21 +187,17 @@ function extractKpis(buffer) {
 
       for (const row of rows) {
 
-        // ── FILTRO: fila válida = tiene TRANSACTION ID o "#" numérico ────────
-        // El Excel CIEN usa "TRANSACTION ID" como columna de secuencia,
-        // no "#". Buscamos cualquiera de las dos.
-        const txId = g(row,
-          'transaction id', 'transaction_id', 'txn id', 'txn_id',
-          'charging session txn id',
-          '#', 'no.', 'n°', 'num', 'numero', 'item', 'seq', 'id',
-        );
-        // La fila es válida si tiene un TRANSACTION ID numérico (> 0)
-        // o una cadena no vacía
-        if (txId === null || txId === undefined) continue;
-        const txNum = Number(txId);
-        // Aceptar: número positivo, o string no-vacío que no sea encabezado
-        if (typeof txId === 'number' && (isNaN(txNum) || txNum <= 0)) continue;
-        if (typeof txId === 'string' && txId.trim() === '') continue;
+        // ── FILTRO: fila válida ───────────────────────────────────────────────
+        // NOTA: "Charging Session Txn Id" está vacío en el Excel CIEN real.
+        // Usamos STATUS, MEMBER NUMBER o STARTED AT como indicadores de validez.
+        // Si ninguno de los tres tiene valor, la fila es encabezado o basura.
+        const _status    = g(row, 'status', 'estado', 'session status', 'charging status');
+        const _member    = g(row, 'member number', 'member_number', 'member name', 'member_name', 'phone', 'usuario', 'user', 'customer', 'cliente');
+        const _startedAt = g(row, 'started at', 'started_at', 'start at', 'start time', 'start_time', 'fecha inicio', 'date');
+        const tieneStatus  = _status    !== null && String(_status).trim()    !== '' && String(_status).trim().toLowerCase()    !== 'status';
+        const tieneMember  = _member    !== null && String(_member).trim()    !== '' && String(_member).trim().toLowerCase()    !== 'member number';
+        const tieneStarted = _startedAt !== null && String(_startedAt).trim() !== '' && String(_startedAt).trim().toLowerCase() !== 'started at';
+        if (!tieneStatus && !tieneMember && !tieneStarted) continue;
 
         filasValidas++;
         totalSesiones++;
@@ -259,10 +265,75 @@ function extractKpis(buffer) {
             console.log(`[extract-kpis] ⚠️  Fecha no parseada (primera ocurrencia): "${startedAtRaw}" (tipo: ${typeof startedAtRaw})`);
           }
         }
+
+        // ── OCUPACIÓN: duración de la sesión por cargador (bloque aditivo) ────
+        // Se guarda lo mínimo para calcular la tasa al final: qué cargador,
+        // qué día, cuánto estuvo ocupado y a qué hora terminó.
+        if (dateStr) {
+          const evse = String(g(row,
+            'evse id', 'evse_id', 'evse name', 'evse_name',
+            'cargador', 'charger', 'punto de carga',
+          ) || '').trim();
+
+          // CHARGING DURATION = entregando energía.
+          // IDLING DURATION   = conectado sin cargar; el vehículo sigue ocupando
+          //                     el cargador, por eso también cuenta como ocupación.
+          const durCarga  = parseDuracionMin(g(row,
+            'charging duration', 'charging_duration',
+            'duracion de carga', 'duración de carga', 'tiempo de carga',
+          ));
+          const durIdling = parseDuracionMin(g(row,
+            'idling duration', 'idling_duration',
+            'duracion de espera', 'duración de espera', 'tiempo de espera',
+          )) || 0;
+
+          const ocupadoMin = (durCarga !== null ? durCarga : 0) + durIdling;
+
+          if (evse && ocupadoMin > 0) {
+            const txn = String(g(row,
+              'charging session txn id', 'transaction id', 'txn id',
+              'id de transaccion', 'id de transacción',
+            ) || '').trim();
+
+            const claveDup = txn
+              ? `${dateStr}|${txn}`
+              : `${dateStr}|${evse}|${startedAtRaw}|${ocupadoMin}`;
+
+            if (!_vistosOcupacion.has(claveDup)) {
+              _vistosOcupacion.add(claveDup);
+
+              // Hora de fin: ENDED AT / PLUGIN END; si no viniera, se deduce
+              // sumando la duración a la hora de inicio.
+              const startMin = parseHoraMinuto(startedAtRaw);
+              let   endMin   = parseHoraMinuto(g(row,
+                'ended at', 'ended_at', 'plugin end', 'plugin_end',
+                'fecha fin', 'fin', 'end time', 'end_time',
+              ));
+              if (startMin !== null && endMin !== null && endMin < startMin) {
+                endMin += 1440; // la sesión cruza la medianoche
+              }
+              if (endMin === null && startMin !== null) {
+                endMin = startMin + ocupadoMin;
+              }
+
+              sesionesOcupacion.push({ evse, fecha: dateStr, startMin, endMin, ocupadoMin });
+            }
+          }
+        }
       }
 
       console.log(`[extract-kpis] Hoja "${sheetName}" → válidas:${filasValidas} | con_fecha:${filasConFecha} | fechas_fallidas:${fechasFallidas}`);
     }
+
+    // ── TASA DE OCUPACIÓN (aditivo) ───────────────────────────────────────────
+    // Σ duraciones ÷ (nº de cargadores distintos × jornada operativa) × 100.
+    // La ventana es de 15 HORAS (900 min), no 24 h: se mide qué parte de la
+    // jornada operativa estuvo ocupado cada cargador. El último día del archivo
+    // se acota a la hora de la última sesión, porque el Excel se exporta antes
+    // de que termine la jornada.
+    const ocupacion = calcularOcupacion(sesionesOcupacion, {
+      ventanaCompletaMin: VENTANA_OPERACION_MIN,
+    });
 
     // ── Último día y KPIs del último día ──────────────────────────────────────
     const diasOrdenados = Object.keys(porDia).sort();
@@ -278,7 +349,10 @@ function extractKpis(buffer) {
         usuarios_unicos: d.usuarios.size,
         kwh_total:       Math.round(d.kwh      * 100) / 100,
         ingresos_netos:  Math.round(d.ingresos * 100) / 100,
-        tasa_ocupacion:  null,
+        // Tasa de ocupación DE ESTE DÍA — es la que se pinta en el correo.
+        tasa_ocupacion:  (ocupacion.porDia[ultimoDia] && ocupacion.porDia[ultimoDia].tasa !== null)
+          ? ocupacion.porDia[ultimoDia].tasa
+          : null,
       };
     }
 
@@ -293,6 +367,16 @@ function extractKpis(buffer) {
     if (kpisUltimoDia) {
       console.log(`  KPIs último día: sesiones=${kpisUltimoDia.total_sesiones} | usuarios=${kpisUltimoDia.usuarios_unicos} | kWh=${kpisUltimoDia.kwh_total} | ingresos=${kpisUltimoDia.ingresos_netos}`);
     }
+
+    // ── Diagnóstico de ocupación ──────────────────────────────────────────────
+    if (ocupacion.tasa === null) {
+      console.log(`  Ocupación:        NO CALCULABLE (faltan EVSE ID o CHARGING DURATION)`);
+    } else {
+      console.log(`  Ocupación período: ${ocupacion.tasa}% (${ocupacion.evses} cargador(es), ${ocupacion.ocupadoMin} de ${ocupacion.disponiblesMin} min — jornada ${VENTANA_OPERACION_MIN / 60} h)`);
+      ocupacion.detalle.forEach(d => {
+        console.log(`    · ${d.fecha}${d.diaCorte ? ' (día en curso, ventana ' + d.ventanaMin + ' min)' : ''}: ${d.tasa}% — ${d.sesiones} sesión(es), ${d.evses} EVSE`);
+      });
+    }
     console.log(`[extract-kpis] ════════════════════════════════════════════`);
 
     return {
@@ -300,10 +384,13 @@ function extractKpis(buffer) {
       usuarios_unicos: usuariosSet.size,
       kwh_total:       Math.round(totalKwh      * 100) / 100,
       ingresos_netos:  Math.round(totalIngresos  * 100) / 100,
-      tasa_ocupacion:  null,
+      // Tasa de ocupación del período completo (ya no es null).
+      tasa_ocupacion:  ocupacion.tasa,
       error:           null,
       ultimo_dia:      ultimoDia,
       kpis_ultimo_dia: kpisUltimoDia,
+      // Detalle por día — aditivo, para diagnóstico y para el dashboard.
+      ocupacion_detalle: ocupacion.detalle,
     };
 
   } catch (err) {
