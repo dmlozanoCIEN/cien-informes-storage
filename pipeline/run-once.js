@@ -32,6 +32,9 @@ const { downloadExcel }               = require('./download-excel');
 const { generateReportUrl, generateUUID } = require('./generate-report-url');
 const { sendReportEmail }             = require('./send-report-email');
 const { extractKpis }                 = require('./extract-kpis');
+/* Modelo de dashboard (v2 | consolidado). Espejo de _AUTO_DASHBOARDS en
+   js/aliados.js: el Action y el botón del panel deben elegir el mismo HTML. */
+const { modeloDashboard, baseDashboardPara, esModeloConocido } = require('./dashboard-modelo');
 
 // ─── Configuración ───────────────────────────────────────────────────────────
 const IS_GH_ACTIONS = process.env.RUN_MODE === 'github-actions';
@@ -151,8 +154,7 @@ function calcularProximoEnvio(config) {
   return new Date(next.getTime() - COL_MS).toISOString();
 }
 
-// ─── Obtener aliados elegibles ────────────────────────────────────────────────
-async function getAliadosElegibles() {
+// ─── Obtener aliados elegibles ────────────────────────────────────────────────async function getAliadosElegibles() {
   // Nota: proximo_envio es campo de texto en NocoDB — no soporta filtros lte/gte
   // Se trae todo lo activo y se filtra en JS por fecha
   let where = `(activo,eq,true)~and(frecuencia,neq,manual)`;
@@ -369,13 +371,28 @@ async function runPipeline(configEnvio) {
     // PASO 3: Generar URL del dashboard apuntando al Excel original en R2/CDN
     // Si se detectó el último día, se añade &day=YYYY-MM-DD para pre-filtrar el dashboard.
     log.info(`[2/4] Generando URL del informe...`);
+
+    /* Modelo de dashboard elegido para este aliado en el panel (columna
+       `dashboard_modelo` de aliado_config_envio). Sin dato, vacío o con un
+       valor desconocido se usa 'v2' y la URL queda igual que siempre.
+       DASHBOARD_BASE_URL sigue mandando: de ahí se toma el origen y la carpeta,
+       y solo se sustituye el nombre del archivo cuando el modelo no es el v2. */
+    const modeloDef = modeloDashboard(configEnvio.dashboard_modelo);
+    const dashBase  = baseDashboardPara(CONFIG.dashboardBaseUrl, configEnvio.dashboard_modelo);
+
+    if (configEnvio.dashboard_modelo && !esModeloConocido(configEnvio.dashboard_modelo)) {
+      log.warn(`dashboard_modelo="${configEnvio.dashboard_modelo}" no reconocido — se usa ${modeloDef.id}`);
+    }
+    log.info(`Modelo de dashboard: ${modeloDef.id} (${modeloDef.archivo})`);
+    log.info(`Base del dashboard:  ${dashBase}`);
+
     const { dashboardUrl } = generateReportUrl({
       aliadoId,
       aliadoName:    aliadoNombre,
       excelUrl,          // ← URL original de R2/CDN, no de GitHub
       reportUuid,
       fecha,
-      dashboardBase: CONFIG.dashboardBaseUrl,
+      dashboardBase: dashBase,
       claveAcceso,
       ultimoDia,         // ← añade &day=YYYY-MM-DD si está disponible
     });
@@ -386,8 +403,23 @@ async function runPipeline(configEnvio) {
       try {
         await nocoRequest(`/api/v2/tables/${CONFIG.tableInformes}/records`, 'PATCH', {
           Id: informeId, url_excel: excelUrl, url_dashboard: dashboardUrl,
+          // Deja en el historial con qué HTML se envió este informe.
+          dashboard_modelo: modeloDef.id,
         });
-      } catch (e) { log.warn(`No se pudo actualizar URLs en NocoDB: ${e.message}`); }
+      } catch (e) {
+        /* Si la columna aún no existe en aliado_informes, NocoDB rechaza el PATCH
+           completo. Se reintenta sin ella para no perder url_dashboard. */
+        if (/dashboard_modelo/i.test(String(e && e.message))) {
+          log.warn('Falta la columna dashboard_modelo en aliado_informes — se guarda sin ella.');
+          try {
+            await nocoRequest(`/api/v2/tables/${CONFIG.tableInformes}/records`, 'PATCH', {
+              Id: informeId, url_excel: excelUrl, url_dashboard: dashboardUrl,
+            });
+          } catch (e2) { log.warn(`No se pudo actualizar URLs en NocoDB: ${e2.message}`); }
+        } else {
+          log.warn(`No se pudo actualizar URLs en NocoDB: ${e.message}`);
+        }
+      }
     }
 
     // PASO 4: Enviar correo con KPIs del último día (o globales si no se detectó)
