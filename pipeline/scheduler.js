@@ -296,7 +296,11 @@ async function runPipelineForAliado(configEnvio) {
        Sin dato, vacío o desconocido → 'v2', y la URL queda igual que siempre.
        DASHBOARD_BASE_URL sigue mandando: solo se cambia el nombre del archivo. */
     const modeloDef = modeloDashboard(configEnvio.dashboard_modelo);
-    const dashBase  = baseDashboardPara(CONFIG.dashboardBaseUrl, configEnvio.dashboard_modelo);
+    /* Se conserva DASHBOARD_BASE_URL y solo se cambia el archivo. El escape
+       hatch DASHBOARD_BASE_URL_<MODELO> permite apuntar un modelo a otra URL. */
+    const dashBase  = baseDashboardPara(CONFIG.dashboardBaseUrl, configEnvio.dashboard_modelo, {
+      override: process.env['DASHBOARD_BASE_URL_' + modeloDef.id.toUpperCase()],
+    });
 
     if (!esModeloConocido(configEnvio.dashboard_modelo) && configEnvio.dashboard_modelo) {
       log.warn(`${prefix} → dashboard_modelo="${configEnvio.dashboard_modelo}" no reconocido — se usa ${modeloDef.id}`);

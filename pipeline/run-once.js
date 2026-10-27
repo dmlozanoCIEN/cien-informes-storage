@@ -154,7 +154,8 @@ function calcularProximoEnvio(config) {
   return new Date(next.getTime() - COL_MS).toISOString();
 }
 
-// ─── Obtener aliados elegibles ────────────────────────────────────────────────async function getAliadosElegibles() {
+// ─── Obtener aliados elegibles ────────────────────────────────────────────────
+async function getAliadosElegibles() {
   // Nota: proximo_envio es campo de texto en NocoDB — no soporta filtros lte/gte
   // Se trae todo lo activo y se filtra en JS por fecha
   let where = `(activo,eq,true)~and(frecuencia,neq,manual)`;
@@ -378,7 +379,14 @@ async function runPipeline(configEnvio) {
        DASHBOARD_BASE_URL sigue mandando: de ahí se toma el origen y la carpeta,
        y solo se sustituye el nombre del archivo cuando el modelo no es el v2. */
     const modeloDef = modeloDashboard(configEnvio.dashboard_modelo);
-    const dashBase  = baseDashboardPara(CONFIG.dashboardBaseUrl, configEnvio.dashboard_modelo);
+    /* `DASHBOARD_BASE_URL` NO se puede leer desde aquí (es un secreto de
+       GitHub), así que nunca se asume su valor: se toma tal cual y solo se
+       cambia el nombre del archivo. Si aun así hiciera falta apuntar un modelo
+       concreto a otra URL, existe el escape hatch DASHBOARD_BASE_URL_<MODELO>
+       (p. ej. DASHBOARD_BASE_URL_CONSOLIDADO), que se usa solo para ese modelo. */
+    const dashBase  = baseDashboardPara(CONFIG.dashboardBaseUrl, configEnvio.dashboard_modelo, {
+      override: process.env['DASHBOARD_BASE_URL_' + modeloDef.id.toUpperCase()],
+    });
 
     if (configEnvio.dashboard_modelo && !esModeloConocido(configEnvio.dashboard_modelo)) {
       log.warn(`dashboard_modelo="${configEnvio.dashboard_modelo}" no reconocido — se usa ${modeloDef.id}`);
